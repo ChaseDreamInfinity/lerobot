@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 # Run the trained Diffusion Policy on the SO-101 from the Jetson Orin.
 #
-# Twin of eval_pick_block_orin.sh (ACT) — same hardware setup, different
-# policy. Diffusion inference is heavier than ACT (denoising loop), so
-# RTC append mode is used so the policy keeps the action queue ahead of
-# the 30 Hz control consumer. If the policy can't keep up, lower the
-# control rate (FPS=15) or raise CAMERA_FPS to feed fresher observations.
+# Twin of eval_pick_block_act_orin.sh (ACT) — same hardware setup, different
+# policy. Uses the sync inference engine: diffusion's predict_action_chunk
+# reads from internal observation queues that only select_action populates,
+# which the RTC engine bypasses.
+#
+# Sampler override: the trained policy ships with DDPM/100 inference steps
+# (~5s per chunk on Orin), which blows any usable per-chunk budget. At
+# deploy time we use DDIM/5 (~250ms per chunk) — same weights, faster
+# sampler. With n_action_steps=8 cached actions per chunk, FPS=15 leaves
+# a 533ms refill budget, comfortably fitting the ~250ms denoise.
 #
 # Override hardware paths without editing the file, for example:
-#   ROBOT_PORT=/dev/serial/by-id/... WRIST_CAMERA=/dev/video0 TOP_CAMERA=/dev/video2 \
+#   ROBOT_PORT=/dev/serial/by-id/... \
 #     scripts/local/eval_pick_block_diffusion_orin.sh
 #
-# Performance tuning examples:
-#   FPS=15 scripts/local/eval_pick_block_diffusion_orin.sh
-#   INFERENCE_TYPE=sync scripts/local/eval_pick_block_diffusion_orin.sh
-#   RTC_ENABLED=true scripts/local/eval_pick_block_diffusion_orin.sh
+# Performance / quality tuning:
+#   NUM_INFERENCE_STEPS=10 scripts/local/eval_pick_block_diffusion_orin.sh   # closer to DDPM/100, slower
+#   NOISE_SCHEDULER_TYPE=DDPM NUM_INFERENCE_STEPS=100 FPS=1 ...              # faithful to training, unusable
 set -euo pipefail
 
 cd /home/nvidia/Workspace/lerobot
@@ -24,22 +28,18 @@ export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 POLICY_PATH="${POLICY_PATH:-chasedreaminf/diffusion_so101-pick-block-in-cup-2cam-run1}"
 ROBOT_PORT="${ROBOT_PORT:-/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A68008652-if00}"
 ROBOT_ID="${ROBOT_ID:-my_follower}"
-WRIST_CAMERA="${WRIST_CAMERA:-/dev/video0}"
-TOP_CAMERA="${TOP_CAMERA:-/dev/video2}"
+WRIST_CAMERA="${WRIST_CAMERA:-/dev/video2}"
+TOP_CAMERA="${TOP_CAMERA:-/dev/video0}"
 DEVICE="${DEVICE:-cuda}"
-FPS="${FPS:-30}"
+FPS="${FPS:-15}"
 CAMERA_WIDTH="${CAMERA_WIDTH:-640}"
 CAMERA_HEIGHT="${CAMERA_HEIGHT:-480}"
 CAMERA_FPS="${CAMERA_FPS:-30}"
 CAMERA_FOURCC="${CAMERA_FOURCC:-MJPG}"
-INFERENCE_TYPE="${INFERENCE_TYPE:-rtc}"
+INFERENCE_TYPE="${INFERENCE_TYPE:-sync}"
 INTERPOLATION_MULTIPLIER="${INTERPOLATION_MULTIPLIER:-1}"
-# Diffusion default chunk: horizon=16, n_action_steps=8. Keep the
-# RTC execution horizon below the chunk size so the queue refills
-# before draining.
-RTC_EXECUTION_HORIZON="${RTC_EXECUTION_HORIZON:-6}"
-RTC_ENABLED="${RTC_ENABLED:-false}"
-RTC_QUEUE_THRESHOLD="${RTC_QUEUE_THRESHOLD:-30}"
+NOISE_SCHEDULER_TYPE="${NOISE_SCHEDULER_TYPE:-DDIM}"
+NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-5}"
 DURATION="${DURATION:-120}"
 TASK="${TASK:-pick up the brown block and place it into the cup}"
 
@@ -84,6 +84,8 @@ args=(
   }" \
   --strategy.type=base \
   --inference.type="${INFERENCE_TYPE}" \
+  --policy.noise_scheduler_type="${NOISE_SCHEDULER_TYPE}" \
+  --policy.num_inference_steps="${NUM_INFERENCE_STEPS}" \
   --task="${TASK}" \
   --fps="${FPS}" \
   --interpolation_multiplier="${INTERPOLATION_MULTIPLIER}" \
@@ -93,11 +95,10 @@ args=(
 )
 
 if [[ "${INFERENCE_TYPE}" == "rtc" ]]; then
-  args+=(
-    --inference.rtc.enabled="${RTC_ENABLED}"
-    --inference.rtc.execution_horizon="${RTC_EXECUTION_HORIZON}"
-    --inference.queue_threshold="${RTC_QUEUE_THRESHOLD}"
-  )
+  echo "INFERENCE_TYPE=rtc is not supported for the diffusion policy:" >&2
+  echo "  predict_action_chunk reads from observation queues populated only by select_action," >&2
+  echo "  which the RTC engine bypasses → empty-stack RuntimeError. Use sync instead." >&2
+  exit 1
 fi
 
 "${args[@]}"
