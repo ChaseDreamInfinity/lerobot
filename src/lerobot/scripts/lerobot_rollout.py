@@ -123,6 +123,7 @@ Usage examples
 """
 
 import logging
+import os
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
@@ -168,7 +169,7 @@ logger = logging.getLogger(__name__)
 @parser.wrap()
 def rollout(cfg: RolloutConfig):
     """Main entry point for policy deployment."""
-    init_logging()
+    init_logging(console_level=os.getenv("LEROBOT_LOG_LEVEL", "INFO"))
 
     if cfg.display_data:
         logger.info("Initializing Rerun visualization (ip=%s, port=%s)", cfg.display_ip, cfg.display_port)

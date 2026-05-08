@@ -22,6 +22,7 @@ way via ``notify_observation``.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import time
@@ -74,6 +75,14 @@ def _normalize_prev_actions_length(prev_actions: torch.Tensor, target_steps: int
     padded = torch.zeros((target_steps, action_dim), dtype=prev_actions.dtype, device=prev_actions.device)
     padded[:steps] = prev_actions
     return padded
+
+
+def _filter_supported_predict_kwargs(policy: PreTrainedPolicy, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Keep RTC kwargs only for policies whose chunk predictor accepts them."""
+    signature = inspect.signature(policy.predict_action_chunk)
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
+        return kwargs
+    return {name: value for name, value in kwargs.items() if name in signature.parameters}
 
 
 # ---------------------------------------------------------------------------
@@ -304,9 +313,11 @@ class RTCInferenceEngine(InferenceEngine):
                                 prev_actions, target_steps=self._rtc_config.execution_horizon
                             )
 
-                        actions = self._policy.predict_action_chunk(
-                            preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
+                        predict_kwargs = _filter_supported_predict_kwargs(
+                            self._policy,
+                            {"inference_delay": delay, "prev_chunk_left_over": prev_actions},
                         )
+                        actions = self._policy.predict_action_chunk(preprocessed, **predict_kwargs)
 
                         original = actions.squeeze(0).clone()
                         processed = self._postprocessor(actions).squeeze(0)
