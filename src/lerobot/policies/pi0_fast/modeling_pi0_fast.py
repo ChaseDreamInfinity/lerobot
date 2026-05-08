@@ -18,7 +18,8 @@ import builtins
 import logging
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, TypedDict
+from typing_extensions import Unpack
 
 import numpy as np
 import torch
