@@ -226,6 +226,10 @@ class RolloutConfig:
     # with the encoder and UNet engines (`python -m lerobot.policies.diffusion.tensorrt_diffusion`).
     tensorrt_engine: str | None = None
 
+    # CUDA graphs (SmolVLA only): replay the KV-cache fill and each denoising step from CUDA
+    # graphs captured at startup (~6.5x faster sampling on a Jetson Orin; outputs unchanged).
+    cuda_graph: bool = False
+
     # Log per-stage control-loop latency (obs, process, policy, send, loop) every N seconds,
     # plus a whole-run summary at the end. 0 disables it. Base strategy only.
     latency_log_interval_s: float = 0.0
@@ -339,6 +343,15 @@ class RolloutConfig:
                 raise ValueError("--tensorrt_engine requires --inference.type=sync")
             if self.use_torch_compile:
                 raise ValueError("--tensorrt_engine and --use_torch_compile are mutually exclusive")
+
+        # --- CUDA graphs ---
+        if self.cuda_graph:
+            if self.policy.type != "smolvla":
+                raise ValueError(f"--cuda_graph supports SmolVLA only, got policy type '{self.policy.type}'")
+            if not str(self.device).startswith("cuda"):
+                raise ValueError(f"--cuda_graph requires a CUDA device, got '{self.device}'")
+            if self.use_torch_compile:
+                raise ValueError("--cuda_graph and --use_torch_compile are mutually exclusive")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

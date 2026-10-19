@@ -343,6 +343,18 @@ class RTCInferenceEngine(InferenceEngine):
                             logger.info("Compile warmup complete (%d inferences)", inference_count)
 
                         logger.debug("RTC inference latency=%.2fs, queue=%d", new_latency, queue.qsize())
+                        # Inference runs off the control loop, so its latency never shows in the
+                        # loop's own timing: summarize it periodically.
+                        if inference_count % 10 == 0 and len(latency_tracker):
+                            logger.info(
+                                "RTC inference: latency last %.0f ms, max of last %d %.0f ms | "
+                                "delay %d ticks | queue %d",
+                                new_latency * 1e3,
+                                len(latency_tracker),
+                                latency_tracker.max() * 1e3,
+                                new_delay,
+                                queue.qsize(),
+                            )
 
                     except Exception as e:
                         consecutive_errors += 1

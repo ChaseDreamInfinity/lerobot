@@ -668,7 +668,9 @@ class VLAFlowMatching(nn.Module):
 
             # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+            # torch.full rather than torch.tensor: same value, but filled on the device instead of
+            # copied from the host (keeps the forward free of host syncs, so it can be graph-captured).
+            img_emb = img_emb * torch.full((), img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
 
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
@@ -716,8 +718,7 @@ class VLAFlowMatching(nn.Module):
         att_masks += [1] * (states_seq_len)
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-        att_masks = att_masks[None, :]
+        att_masks = self._prefix_att_mask(att_masks, pad_masks.device)[None, :]
 
         seq_len = pad_masks.shape[1]
         if seq_len < self.prefix_length:
@@ -729,11 +730,23 @@ class VLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks
 
+    def _prefix_att_mask(self, att_masks: list[int], device: torch.device) -> Tensor:
+        """Device tensor for an attention-mask pattern, cached by pattern.
+
+        The pattern only depends on input shapes, so it is copied to the device once rather than
+        on every call; a per-call host-to-device copy would stall the CPU and prevent CUDA graph
+        capture of the prefix.
+        """
+        key = (tuple(att_masks), device)
+        cache = self.__dict__.setdefault("_prefix_att_mask_cache", {})
+        if key not in cache:
+            cache[key] = torch.tensor(att_masks, dtype=torch.bool, device=device)
+        return cache[key]
+
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
-        att_masks = []
 
         # Fuse timestep + action information using an MLP
         action_emb = self.action_in_proj(noisy_actions)
@@ -765,11 +778,11 @@ class VLAFlowMatching(nn.Module):
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] * self.config.chunk_size
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        # Allocated on the device rather than copied from a Python list: a host-to-device copy on
+        # every denoising step stalls the CPU and makes the step impossible to capture in a CUDA graph.
+        att_masks = torch.ones(bsize, self.config.chunk_size, dtype=embs.dtype, device=embs.device)
         return embs, pad_masks, att_masks
 
     def forward(

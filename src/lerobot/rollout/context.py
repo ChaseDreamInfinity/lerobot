@@ -46,6 +46,7 @@ from lerobot.processor import (
 from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
 from lerobot.robots import make_robot_from_config
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
+from lerobot.utils.constants import OBS_STR
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 
 from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
@@ -414,6 +415,18 @@ def build_rollout_context(
             "SyncInferenceEngine does not support policies with relative actions for now."
             "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
         )
+
+    if cfg.cuda_graph:
+        from lerobot.policies.smolvla.cuda_graph_smolvla import enable_cuda_graphs
+
+        # Capture now, for the cameras the policy will actually see (after any rename), so the
+        # first real prediction is not slowed down by capture.
+        image_keys = [
+            cfg.rename_map.get(key, key)
+            for key, ft in dataset_features.items()
+            if key.startswith(f"{OBS_STR}.images.") and ft["dtype"] in ("image", "video")
+        ]
+        enable_cuda_graphs(policy, present_image_keys=image_keys)
 
     # --- 7. Inference strategy (needs policy + pre/post + hardware) --
     logger.info(
