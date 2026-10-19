@@ -224,8 +224,9 @@ class RolloutConfig:
     # TensorRT: replaces the policy's network with engines built per checkpoint and device.
     # ACT: an engine file (`python -m lerobot.policies.act.tensorrt_act`). Diffusion: a directory
     # with the encoder and UNet engines (`python -m lerobot.policies.diffusion.tensorrt_diffusion`).
-    # SmolVLA: a directory with vision, KV-fill and step engines
-    # (`python -m lerobot.policies.smolvla.tensorrt_smolvla`); works with RTC inference.
+    # SmolVLA and PI0.5: a directory with vision, KV-fill and step engines
+    # (`python -m lerobot.policies.smolvla.tensorrt_smolvla`, `... .pi05.tensorrt_pi05`); works with
+    # RTC inference.
     tensorrt_engine: str | None = None
 
     # CUDA graphs (SmolVLA and PI0.5): replay the KV-cache fill and each denoising step from CUDA
@@ -336,13 +337,16 @@ class RolloutConfig:
 
         # --- TensorRT ---
         if self.tensorrt_engine:
-            if self.policy.type not in ("act", "diffusion", "smolvla"):
+            if self.policy.type not in ("act", "diffusion", "smolvla", "pi05"):
                 raise ValueError(
-                    f"--tensorrt_engine supports ACT, Diffusion and SmolVLA, got policy type '{self.policy.type}'"
+                    "--tensorrt_engine supports ACT, Diffusion, SmolVLA and PI0.5, "
+                    f"got policy type '{self.policy.type}'"
                 )
             if not str(self.device).startswith("cuda"):
                 raise ValueError(f"--tensorrt_engine requires a CUDA device, got '{self.device}'")
-            if self.policy.type != "smolvla" and not isinstance(self.inference, SyncInferenceConfig):
+            if self.policy.type in ("act", "diffusion") and not isinstance(
+                self.inference, SyncInferenceConfig
+            ):
                 raise ValueError(f"--tensorrt_engine for {self.policy.type} requires --inference.type=sync")
             if self.cuda_graph:
                 raise ValueError(

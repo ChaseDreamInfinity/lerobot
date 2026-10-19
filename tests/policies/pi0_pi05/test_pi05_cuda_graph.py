@@ -31,6 +31,12 @@ def make_policy(make_config, rtc: bool):
     if rtc:
         config.rtc_config = RTCConfig(enabled=True, execution_horizon=5)
     policy = PI05Policy(config).to("cuda").eval()
+    # PI0.5 initializes the expert's adaptive-norm projections to zero, which zeroes every expert
+    # layer's gated residual: give them weights, so the tests exercise the expert's layers.
+    with torch.no_grad():
+        for module in policy.model.paligemma_with_expert.gemma_expert.modules():
+            if getattr(module, "dense", None) is not None:
+                module.dense.weight.normal_(0, 0.05)
     if rtc:
         policy.init_rtc_processor()
     return policy

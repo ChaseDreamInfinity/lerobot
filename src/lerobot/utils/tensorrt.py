@@ -149,6 +149,7 @@ class TensorRTEngine:
         dtypes = {
             trt.DataType.FLOAT: torch.float32,
             trt.DataType.HALF: torch.float16,
+            trt.DataType.BF16: torch.bfloat16,
             trt.DataType.INT32: torch.int32,
             trt.DataType.INT64: torch.int64,
             trt.DataType.BOOL: torch.bool,

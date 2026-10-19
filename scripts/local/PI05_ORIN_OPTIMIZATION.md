@@ -2,21 +2,22 @@
 
 The pi-0.5 (`pi05`) pick-block policy on the SO-101, run from a Jetson AGX Orin 64 GB (JetPack
 6.2, MAXN). Companion to `SMOLVLA_ORIN_OPTIMIZATION.md`: the same approach (CUDA graphs around the
-KV fill and denoising step), applied to a model 5× larger.
+KV fill and denoising step, then TensorRT engines), applied to a model 5× larger.
 
 ## Quick start
 
 ```bash
 bash scripts/local/orin_max_perf.sh                       # once per boot
-bash scripts/local/eval_pick_block_pi05_orin.sh --cuda-graph
+bash scripts/local/eval_pick_block_pi05_orin.sh --trt     # builds the engines on first use (~4 min)
 bash scripts/local/eval_pick_block_pi05_orin.sh --help    # every override
 ```
 
-| Mode | Load | Prediction | RTC delay at 30 Hz |
-|---|---|---|---|
-| Before (eager, 10 Hz script) | 213 s | ~1.15 s | (13 ticks at 10 Hz) |
-| Eager | 7 s | ~1.15 s | ~35 ticks: the queue runs dry at 30 Hz |
-| **`--cuda-graph`** | 7 s + 3 s capture | **~0.52 s** | **16 ticks**, 0 overruns |
+| Mode | Startup | Prediction (real loop) | RTC delay at 30 Hz | Actions vs fp32 |
+|---|---|---|---|---|
+| Before (eager, 10 Hz script) | 213 s | ~1.2 s | (13 ticks at 10 Hz) | bf16 |
+| Eager | 7 s | ~1.2 s | ~35 ticks: the queue runs dry at 30 Hz | bf16 |
+| `--cuda-graph` | ~35 s | ~0.52 s | 16 ticks, 0 overruns | bf16 (TF32 images) |
+| **`--trt`** | ~60 s | **~0.26 s** | **8 ticks**, 0 overruns | **~2× closer than bf16** |
 
 ## The model
 
@@ -126,25 +127,78 @@ inference starts with 25 left. The old behaviour is one line away:
 `FPS=10 NUM_ACTION_STEPS=20 RTC_ENABLED=false RTC_EXECUTION_HORIZON=10 RTC_QUEUE_THRESHOLD=30`.
 The script warns when running eager above 10 Hz, since eager inference outlasts the queue.
 
+### 2026-10-19 — TensorRT: 0.5 s → 0.25 s, more accurate than bf16
+
+`lerobot.policies.pi05.tensorrt_pi05` builds three engines, staged and measured one at a time:
+
+| Engine | PyTorch (graphed) | TensorRT | Error vs fp32: PyTorch bf16 → TensorRT |
+|---|---|---|---|
+| Vision, 2 images (fp16) | 161 ms fp32, ~69 ms TF32 | 20.5 ms | (fp32 → 0.0043) |
+| KV fill, Gemma 2B (strongly typed fp16) | 290 ms | 152 ms | 0.025 → 0.0078 |
+| One denoising step (strongly typed fp16) | 14.1 ms | 7.4 ms | 0.0063 → 0.0013 |
+
+**fp16, not bf16.** TensorRT 10.3 builds bf16 on the Orin, and a strongly typed bf16 step
+(7.97 ms) matches PyTorch's arithmetic. fp16 has 3 more mantissa bits and doesn't overflow
+where it matters, so it is both faster and about 5× more accurate:
+- **Expert:** finite throughout.
+- **Gemma 2B:** hidden states peak at ~22k, inside fp16's 65,504. Only the last layer's output
+  reaches 161,792 and overflows, and the KV cache doesn't use it: the last layer's K/V come from
+  its input.
+
+**Strongly typed or wrong.** As with SmolVLA, a plain `--fp16` build of the fp16 export is
+silently wrong (step relative error 1.03, all finite). Building strongly typed keeps the model's
+explicit fp32 upcasts in RMSNorm and attention.
+
+**Precomputed AdaRMS modulations.** The expert's adaptive norms project the time embedding
+through 37 fp32 3072×1024 matrices (475 MB). They depend only on the timestep, and the loop only
+visits 10 fixed timesteps. So the step engine takes the modulations as an input instead, from a
+`[10, 37, 3072]` table computed once at attach time with the model's own ops and looked up on
+the device inside the CUDA graph. This removed 475 MB of weight reads from every step and
+shrank the step engine to 625 MB. It also kept the model's float64 time embedding out of
+TensorRT, which has no float64: computing it in float32 shifted `v_t` by up to 0.026, because
+pi0.5's 0.004 minimum period makes the sine arguments large.
+
+**Smaller fixes along the way:**
+- `PiGemmaModel` casts its input to bf16 only when its weights are bf16, so the fp16 export
+  copies cast the embeddings to the weight dtype themselves (a no-op for bf16).
+- `TensorRTEngine` maps bf16 tensors.
+
+**Tests.** pi0.5 initializes the expert's AdaRMS projections to zero, which zeroes every expert
+layer's gated residual in a fresh model. The miniature test policies now get random projection
+weights, so the graph and TensorRT tests actually exercise the expert.
+
+**Results:**
+
+| | Prediction (offline) | With RTC | Actions vs fp32, max (mean) | With RTC |
+|---|---|---|---|---|
+| bf16 eager = CUDA graphs | 588 ms | | 0.037 (0.0053) | 0.014 (0.0021) |
+| **TensorRT** | **246 ms** | **249 ms** | **0.019 (0.0032)** | **0.0066 (0.0008)** |
+
+**Real loop** (`--trt`, real cameras, stand-in arm, 60 s): 29.9 Hz, 0 overruns, RTC inference
+258–263 ms (max 277), delay 8 ticks, queue 42–43 after merge.
+- **Startup:** about a minute (loading 5.2 GB of engines, self-check, capture).
+- **Engine build:** 200 s, with at least 21 GB of memory still available throughout.
+
 ### Next
 
-**Robot trials** at 30 Hz with `--cuda-graph`:
+**Robot trials** at 30 Hz:
 
 | Configuration | Command | Attempts | Successes | Notes |
 |---|---|---|---|---|
-| CUDA graphs, blue block | `eval_pick_block_pi05_orin.sh --cuda-graph` | | | new defaults |
-| CUDA graphs, brown block | `TASK="pick up the brown block …" … --cuda-graph` | | | compare with SmolVLA |
+| TensorRT, blue block | `eval_pick_block_pi05_orin.sh --trt` | | | new defaults |
+| TensorRT, brown block | `TASK="pick up the brown block …" … --trt` | | | compare with SmolVLA |
 
-**TensorRT:** the remaining ~0.5 s is mostly GPU-bound work: KV fill 290 ms, 10 steps 141 ms,
-images ~70 ms. SmolVLA's TensorRT path, which runs everything in fp16 and keeps the model's fp32
-upcasts by building strongly typed, would likely get the KV fill to ~150 ms and the steps to ~7
-ms each, roughly **0.5 s → 0.25 s** (delay 16 → 8 ticks). Unlike SmolVLA, the step's KV cache
-is a transformers `DynamicCache`, so the export wrappers need flat K/V tensors.
+**Remaining time:** KV fill 152 ms, 10 steps 74 ms, vision 20 ms. The KV fill is compute-bound
+(3.8 TFLOP at ~25 TFLOPS), and the step is near its weight-bandwidth floor (~5 ms for 625 MB).
 
 ## How the speed-up works
 
 - **Loading:** `PI05Policy.from_pretrained` skips random initialization when the checkpoint
   covers every parameter.
+- **TensorRT:** `lerobot-rollout --tensorrt_engine=<dir>` attaches the three engines
+  (`attach_tensorrt_engines`), checks each one against PyTorch, and replays them through the same
+  graphed sampler as `--cuda_graph`. Build them with `scripts/local/build_pi05_trt_engine_orin.sh`,
+  or let `eval_pick_block_pi05_orin.sh --trt` do it.
 - **CUDA graphs:** `lerobot-rollout --cuda_graph=true` (SmolVLA or PI0.5) calls
   `enable_cuda_graphs(policy, present_image_keys)`. That replaces `model.sample_actions` with
   `GraphedSampler` and captures the graphs from a dummy prediction. Batch sizes other than 1, or
@@ -159,6 +213,8 @@ is a transformers `DynamicCache`, so the export wrappers need flat K/V tensors.
 - `test_pi05_loading.py`: `from_pretrained` matches the saved policy bit for bit, and a
   checkpoint missing a parameter gets the fallback (an initialized model, not skipped-init
   memory).
+- `test_pi05_tensorrt.py`: engines built for the miniature policy; sampling matches eager with
+  and without RTC, and engines from another checkpoint are rejected.
 - `test_pi05_cuda_graph.py`:
   - graphed sampling matches eager with and without RTC;
   - TF32 images stay close to fp32, and the global TF32 flags are restored;

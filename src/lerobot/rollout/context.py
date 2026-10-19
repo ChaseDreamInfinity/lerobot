@@ -222,8 +222,8 @@ def build_rollout_context(
         except Exception as e:
             logger.warning("Failed to apply torch.compile: %s", e)
 
-    # SmolVLA engines attach further down, once the camera keys the policy will see are known.
-    if cfg.tensorrt_engine and policy.name != "smolvla":
+    # SmolVLA and PI0.5 engines attach further down, once the camera keys the policy will see are known.
+    if cfg.tensorrt_engine and policy.name not in ("smolvla", "pi05"):
         # `policy.name`, not `policy.type`: on an nn.Module, `.type` is the dtype-cast method.
         if policy.name == "diffusion":
             from lerobot.policies.diffusion.tensorrt_diffusion import attach_tensorrt_engines
@@ -417,7 +417,7 @@ def build_rollout_context(
             "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
         )
 
-    if cfg.cuda_graph or (cfg.tensorrt_engine and policy.name == "smolvla"):
+    if cfg.cuda_graph or (cfg.tensorrt_engine and policy.name in ("smolvla", "pi05")):
         # Capture CUDA graphs now, for the cameras the policy will actually see (after any rename),
         # so the first real prediction is not slowed down by capture.
         image_keys = [
@@ -425,7 +425,11 @@ def build_rollout_context(
             for key, ft in dataset_features.items()
             if key.startswith(f"{OBS_STR}.images.") and ft["dtype"] in ("image", "video")
         ]
-        if cfg.tensorrt_engine:
+        if cfg.tensorrt_engine and policy.name == "pi05":
+            from lerobot.policies.pi05.tensorrt_pi05 import attach_tensorrt_engines as attach_pi05_engines
+
+            attach_pi05_engines(policy, cfg.tensorrt_engine, present_image_keys=image_keys)
+        elif cfg.tensorrt_engine:
             from lerobot.policies.smolvla.tensorrt_smolvla import attach_tensorrt_engines
 
             attach_tensorrt_engines(policy, cfg.tensorrt_engine, present_image_keys=image_keys)

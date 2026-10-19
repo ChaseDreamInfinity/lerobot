@@ -151,8 +151,10 @@ class GraphedSampler:
     """Drop-in replacement for ``PI05Pytorch.sample_actions``.
 
     The KV fill and denoising step run from CUDA graphs over ``fill_kv`` and ``denoise`` (the
-    PyTorch model by default). ``tf32_images`` encodes images with TF32 matmuls (see the module
-    docstring); without it, sampling is bit-identical to eager.
+    PyTorch model by default; TensorRT engines in ``tensorrt_pi05``). ``encode_images``, if given,
+    encodes all non-constant camera images of a prediction in one batched call. ``tf32_images``
+    encodes images eagerly with TF32 matmuls (see the module docstring); without it, PyTorch
+    sampling is bit-identical to eager.
     """
 
     def __init__(
@@ -161,11 +163,13 @@ class GraphedSampler:
         fill_kv: FillKV | None = None,
         denoise: Denoise | None = None,
         tf32_images: bool = True,
+        encode_images: Callable[[Tensor], Tensor] | None = None,
     ):
         self.model = model
         self.eager = model.sample_actions
         self.fill_kv = fill_kv or pytorch_fill_kv(model)
         self.denoise = denoise or pytorch_denoise(model)
+        self.encode_images = encode_images
         self._graphs: dict[tuple, _PrefixGraphs] = {}
 
         paligemma_with_expert = model.paligemma_with_expert
@@ -186,9 +190,20 @@ class GraphedSampler:
         if noise is None:
             noise = model.sample_noise((bsize, config.chunk_size, config.max_action_dim), device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
-            self._with_cached_constants(images), img_masks, tokens, masks
-        )
+        images = self._with_cached_constants(images)
+        if self.encode_images is not None:
+            real = [image for image in images if id(image) not in self.image_cache.constants]
+            if real:
+                embeddings = self.encode_images(torch.cat(real))
+                self.image_cache.precomputed = {
+                    id(image): (image, embeddings[i : i + 1]) for i, image in enumerate(real)
+                }
+        try:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+                images, img_masks, tokens, masks
+            )
+        finally:
+            self.image_cache.precomputed = {}
         key = (tuple(prefix_embs.shape), prefix_embs.dtype)
         if key not in self._graphs:
             logger.info("Capturing PI0.5 CUDA graphs for prefix shape %s", tuple(prefix_embs.shape))
