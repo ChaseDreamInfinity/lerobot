@@ -390,3 +390,29 @@ def test_latency_monitor_ignores_marks_outside_a_tick():
     monitor.end_tick()
     monitor.log_run_summary()  # nothing recorded: must not raise
     assert monitor._run == {}
+
+
+def test_latency_monitor_logs_loop_last_when_first_tick_sends_nothing(monkeypatch, caplog):
+    import logging
+
+    from lerobot.rollout import latency as latency_mod
+
+    clock = [0.0]
+    monkeypatch.setattr(latency_mod.time, "perf_counter", lambda: clock[0])
+    monitor = latency_mod.LatencyMonitor(interval_s=1.0, fps=10)
+
+    with caplog.at_level(logging.INFO, logger=latency_mod.__name__):
+        for sends in (False, True, True):  # no action queued yet on the first tick
+            monitor.start_tick()
+            clock[0] += 0.01
+            monitor.mark("policy")
+            if sends:
+                clock[0] += 0.01
+                monitor.mark("send")
+            monitor.end_tick()
+            clock[0] += 0.5
+        monitor.log_run_summary()
+
+    for record in caplog.records:
+        message = record.getMessage()
+        assert message.index("send ") < message.index("loop "), message

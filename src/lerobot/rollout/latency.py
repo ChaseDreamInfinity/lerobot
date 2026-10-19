@@ -24,6 +24,12 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 
+def _ordered(stages) -> list[str]:
+    """Stages in first-seen order with ``loop`` last. A tick that sends no action (e.g. before the
+    first chunk arrives) records ``loop`` without ``send``, which would otherwise reorder the log."""
+    return [stage for stage in stages if stage != "loop"] + (["loop"] if "loop" in stages else [])
+
+
 @dataclass
 class _Stats:
     samples: list[float] = field(default_factory=list)
@@ -98,7 +104,7 @@ class LatencyMonitor:
 
     def _log_window(self, now: float) -> None:
         elapsed = now - self._window_start
-        stages = " | ".join(f"{stage} {stats.summary()}" for stage, stats in self._window.items())
+        stages = " | ".join(f"{stage} {self._window[stage].summary()}" for stage in _ordered(self._window))
         logger.info(
             "Latency over %.0fs: %d ticks, %.1f Hz (target %.0f) | %s ms (mean/p99/max) | overruns %d (budget %.1f ms)",
             elapsed,
@@ -119,7 +125,8 @@ class LatencyMonitor:
             return
         elapsed = time.perf_counter() - self._run_start
         stages = " | ".join(
-            f"{stage} {total / count:.1f}/{peak:.1f}" for stage, (count, total, peak) in self._run.items()
+            f"{stage} {self._run[stage][1] / self._run[stage][0]:.1f}/{self._run[stage][2]:.1f}"
+            for stage in _ordered(self._run)
         )
         logger.info(
             "Latency for the whole run (%.0fs): %d ticks, %.1f Hz (target %.0f) | %s ms (mean/max) | "
