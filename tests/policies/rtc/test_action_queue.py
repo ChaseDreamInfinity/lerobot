@@ -434,31 +434,59 @@ def test_merge_with_different_lengths():
 # merge() delay validation tests
 
 
-def test_merge_validates_delay_consistency(action_queue_rtc_enabled, sample_actions, caplog):
-    """Test merge() validates that real_delay matches action index difference."""
-    import logging
+def test_merge_skips_executed_actions_not_latency_estimate(action_queue_rtc_enabled, sample_actions):
+    """merge() drops the actions executed during inference, counted, not the latency estimate.
 
-    caplog.set_level(logging.WARNING)
-
-    # Initialize queue
+    ceil(latency / dt) overshoots whenever inference ends mid-tick: 128 ms at 30 Hz is 3.84 ticks,
+    estimated as 4, while 3 actions were executed. Dropping 4 would skip an unexecuted action.
+    """
     action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
-
-    # Consume 5 actions
-    for _ in range(5):
+    index_before = action_queue_rtc_enabled.get_action_index()
+    for _ in range(3):  # executed while the next chunk was being computed
         action_queue_rtc_enabled.get()
 
-    # Merge with mismatched delay (should log warning)
-    # We consumed 5 actions, so index is 5. If we pass action_index_before_inference=0,
-    # then indexes_diff=5, but if real_delay=3, it will warn
     action_queue_rtc_enabled.merge(
         sample_actions["original"],
         sample_actions["processed"],
-        real_delay=3,
-        action_index_before_inference=0,
+        real_delay=4,
+        action_index_before_inference=index_before,
     )
 
-    # Check warning was logged
-    assert "Indexes diff is not equal to real delay" in caplog.text
+    assert action_queue_rtc_enabled.qsize() == 50 - 3
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][3])
+
+
+def test_merge_keeps_whole_first_chunk(action_queue_rtc_enabled, sample_actions):
+    """Nothing is executed before the first chunk arrives, whatever the inference latency."""
+    index_before = action_queue_rtc_enabled.get_action_index()
+    action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=5,
+        action_index_before_inference=index_before,
+    )
+
+    assert action_queue_rtc_enabled.qsize() == 50
+    torch.testing.assert_close(action_queue_rtc_enabled.get(), sample_actions["processed"][0])
+
+
+def test_merge_when_queue_ran_dry_during_inference(action_queue_rtc_enabled, sample_actions):
+    """If the queue empties mid-inference, the robot idles at its last action: skip only what ran."""
+    action_queue_rtc_enabled.merge(sample_actions["short"], sample_actions["short"], real_delay=0)
+    for _ in range(8):
+        action_queue_rtc_enabled.get()
+    index_before = action_queue_rtc_enabled.get_action_index()
+    for _ in range(6):  # 2 actions left, then 4 ticks with nothing to execute
+        action_queue_rtc_enabled.get()
+
+    action_queue_rtc_enabled.merge(
+        sample_actions["original"],
+        sample_actions["processed"],
+        real_delay=6,
+        action_index_before_inference=index_before,
+    )
+
+    assert action_queue_rtc_enabled.qsize() == 50 - 2
 
 
 def test_merge_no_warning_when_delays_match(action_queue_rtc_enabled, sample_actions, caplog):
@@ -482,12 +510,12 @@ def test_merge_no_warning_when_delays_match(action_queue_rtc_enabled, sample_act
         action_index_before_inference=0,
     )
 
-    # Should not have warning
-    assert "Indexes diff is not equal to real delay" not in caplog.text
+    assert action_queue_rtc_enabled.qsize() == 45
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-def test_merge_skips_validation_when_action_index_none(action_queue_rtc_enabled, sample_actions, caplog):
-    """Test merge() skips delay validation when action_index_before_inference is None."""
+def test_merge_falls_back_to_latency_estimate_without_index(action_queue_rtc_enabled, sample_actions, caplog):
+    """merge() uses the latency estimate when the action index at inference start is unknown."""
     import logging
 
     caplog.set_level(logging.WARNING)
@@ -497,16 +525,16 @@ def test_merge_skips_validation_when_action_index_none(action_queue_rtc_enabled,
     for _ in range(5):
         action_queue_rtc_enabled.get()
 
-    # Pass None for action_index_before_inference
+    # Without the index at inference start, the latency estimate is the only delay available
     action_queue_rtc_enabled.merge(
         sample_actions["original"],
         sample_actions["processed"],
-        real_delay=999,  # Doesn't matter
+        real_delay=7,
         action_index_before_inference=None,
     )
 
-    # Should not warn (validation skipped)
-    assert "Indexes diff is not equal to real delay" not in caplog.text
+    assert action_queue_rtc_enabled.qsize() == 50 - 7
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 # Thread safety tests
@@ -790,8 +818,10 @@ def test_typical_rtc_workflow(action_queue_rtc_enabled, sample_actions):
 
     assert action_queue_rtc_enabled.qsize() == 40
 
-    # Second inference with delay
+    # Second inference: 5 actions are executed while it runs
     action_index_before = action_queue_rtc_enabled.get_action_index()
+    for _ in range(5):
+        action_queue_rtc_enabled.get()
 
     action_queue_rtc_enabled.merge(
         sample_actions["original"],

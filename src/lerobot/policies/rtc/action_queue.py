@@ -218,28 +218,27 @@ class ActionQueue:
     def _check_and_resolve_delays(
         self, real_delay: int, action_index_before_inference: int | None = None
     ) -> int:
-        """Validate that computed delays match expectations.
+        """Number of new actions to skip: those whose time passed while the policy was inferring.
 
-        Compares the delay computed from inference latency with the actual
-        number of actions consumed during inference.
+        When the action index at inference start is known, this is the number of actions actually
+        executed since then, counted from the queue. ``real_delay``, estimated from latency as
+        ``ceil(latency / dt)``, is only a fallback: rounding up overshoots by one whenever inference
+        ends partway through a control tick (almost always), which skipped one unexecuted action at
+        every chunk boundary. The counted value is also right when the queue ran dry during
+        inference: the robot idled at the last executed action, so the new chunk must continue
+        from there.
 
         Args:
-            real_delay: Delay computed from inference latency.
+            real_delay: Delay estimated from inference latency, in actions.
             action_index_before_inference: Action index when inference started.
 
         Returns:
-            int: Delay to use.
+            int: Number of leading actions of the new chunk to drop.
         """
-        effective_delay = max(0, real_delay)
+        if action_index_before_inference is None:
+            return max(0, real_delay)
 
-        if action_index_before_inference is not None:
-            indexes_diff = max(0, self.last_index - action_index_before_inference)
-            if indexes_diff != real_delay:
-                logger.warning(
-                    "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
-                    indexes_diff,
-                    real_delay,
-                )
-                return real_delay
-
-        return effective_delay
+        executed = max(0, self.last_index - action_index_before_inference)
+        if executed != real_delay:
+            logger.debug("Skipping %d executed actions (latency estimate was %d)", executed, real_delay)
+        return executed
