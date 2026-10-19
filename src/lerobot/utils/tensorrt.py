@@ -143,6 +143,7 @@ class TensorRTEngine:
             trt.DataType.HALF: torch.float16,
             trt.DataType.INT32: torch.int32,
             trt.DataType.INT64: torch.int64,
+            trt.DataType.BOOL: torch.bool,
         }
         self.shapes = {name: tuple(self.engine.get_tensor_shape(name)) for name in names}
         self.dtypes = {name: dtypes[self.engine.get_tensor_dtype(name)] for name in names}

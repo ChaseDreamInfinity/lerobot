@@ -212,6 +212,85 @@ Where the 128 ms went, against a published TensorRT implementation and a hardwar
 - **Effect on the robot:** the denoising gain would take the delay from 4 ticks to 3, so a
   TensorRT export is not worth its cost on this board for now.
 
+### 2026-10-19 — TensorRT study (stages 1–3)
+
+The aim: find out, for study purposes, how much a plain TensorRT export can gain without the
+EdgeVLA fork's custom plugins. To reproduce, run `scripts/local/smolvla_trt_study.py`
+(`export` / `build` / `eval`). Engines go to `outputs/trt_engines/smolvla_study_orin/`. It is not
+used by rollout.
+
+**Stage 1: one denoising step.**
+- **Export:** the action expert's step, with all 16 layers' cached K/V as 32 explicit inputs,
+  exported to ONNX with the standard exporter in 8 s (403 MB). Two changes were needed:
+  - **Masks.** TensorRT cannot sum or multiply bool tensors, which the step does on the padding
+    masks for position ids and 2D masks. The wrapper does that arithmetic in int32, and is
+    checked to match the model's own `denoise_step` exactly.
+  - **Time embedding.** TensorRT has no float64, so the sinusoidal time embedding is computed in
+    float32 for export.
+- **Speed:**
+
+  | One denoising step | GPU time |
+  |---|---|
+  | Our CUDA graph, bf16 | 6.5 ms |
+  | TensorRT fp32 (TF32) | 4.8 ms |
+  | TensorRT bf16 | 3.5 ms |
+  | **TensorRT fp16** | **2.9 ms** |
+  | EdgeVLA-TRT fork | 4.0 ms |
+  | Memory floor | 1.17 ms |
+
+**Stage 2: accuracy.** Full 10-step sampling with the same noise and K/V from PyTorch, compared
+with fp32 PyTorch (actions have std 0.82):
+- **bf16 PyTorch (today):** max 0.047, mean 0.0024.
+- **TensorRT fp16 step:** max 0.054, mean 0.0022, the same accuracy as today.
+- **TensorRT bf16 step:** least accurate, with a mean of 0.0042.
+
+**Stage 3: KV-cache fill.**
+- **Export:** the 16-layer prefix pass, with the same int32 mask rewrite, matching the model
+  exactly (612 MB ONNX).
+- **Results:**
+
+  | KV fill | GPU time | K/V relative error vs fp32 |
+  |---|---|---|
+  | Our CUDA graph, bf16 | 13.9 ms | 0.058 (bf16 PyTorch) |
+  | TensorRT fp32 | 12.7 ms | **0.002** |
+  | TensorRT bf16 | 8.1 ms | 0.19, which made actions 4× worse than today |
+  | TensorRT fp16 | 7.9 ms | **1.29: unusable** |
+  | TensorRT fp16 with RMSNorm ops in fp32 | 7.9 ms | 1.24: still unusable |
+
+- **fp16 overflows.** Prefix activations reach ~7,400, and the bf16-trained VLM has values fp16
+  cannot hold (max 65,504). The engine produces no infinities, just silently wrong K/V. Keeping
+  RMSNorm's square, mean and rsqrt in fp32 did not help, so the overflow is elsewhere. The likely
+  culprit is the attention scores: PyTorch upcasts them to fp32 explicitly, but that cast
+  disappears in an fp32 export. Pinning the overflowing layers needs a layer-by-layer comparison,
+  e.g. with Polygraphy.
+
+**End to end:** image encoding stays eager, with the empty-slot cache. The fp32 KV engine and the
+fp16 step engine × 10 are captured in **one CUDA graph**, since TensorRT launches can be captured.
+Without the graph, each engine call from Python costs ~1.6 ms extra for argument binding and
+stream sync.
+
+| Path | Prediction | Actions vs fp32 eager (max / mean) |
+|---|---|---|
+| PyTorch eager bf16 | 723 ms | 0.113 / 0.0027 |
+| CUDA graphs (`--cuda_graph`, committed) | 113 ms | 0.113 / 0.0027 (identical to eager) |
+| EdgeVLA-TRT fork (published, other checkpoint) | 83 ms | — |
+| **TensorRT fp32 KV + fp16 step, in one CUDA graph** | **75.8 ms** | **0.007 / 0.0007** |
+
+**Findings:**
+- **Faster than the fork, with no custom plugins.** 75.8 ms against 83 ms, using only JetPack's
+  TensorRT 10.3 and the standard ONNX exporter.
+- **More accurate than today.** Only the action expert runs in fp16, and it does not overflow,
+  while the KV fill keeps fp32. bf16 PyTorch is further from fp32 than this path.
+- **Where the time goes now:** ~33 ms of eager image encoding (GPU-bound), ~13 ms of KV fill,
+  ~29 ms of steps (10 × 2.9).
+- **Next levers:**
+  - **An fp16-safe KV fill** (find the overflowing layers): −5 ms.
+  - **INT8 expert weights:** the step is memory-bound, so up to ~−15 ms.
+  - Either way, about 75 → 55–70 ms.
+- **What it would mean on the robot:** at 30 Hz, 75 ms is a delay of about 3 ticks against today's
+  4. Integrating it would mean engines per checkpoint and a rewrite of the RTC loop around a
+  graphed TensorRT sampler, which is not justified by one tick. It stays a study.
+
 ### Next
 
 **Robot trials** with the fixed camera mapping, at 30 Hz:
