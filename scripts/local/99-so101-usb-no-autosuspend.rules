@@ -1,0 +1,22 @@
+# Disable USB autosuspend for the SO-101 rig's cameras and the hubs feeding them.
+#
+# The cameras ship with power/control=auto and a 2s idle timer. A suspended UVC
+# device returns read failures instantly instead of blocking, which kills
+# lerobot's camera read thread (10 consecutive failures -> thread dies).
+#
+# This must be a udev rule rather than a one-shot sysfs write: the setting reverts
+# to "auto" every time a device re-enumerates, and these cameras re-enumerate often.
+#
+# Install (note: udevadm trigger defaults to --action=change, so this rule deliberately
+# does NOT match on ACTION — it applies to both add and change events):
+#   sudo cp scripts/local/99-so101-usb-no-autosuspend.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=usb --action=add
+
+# wrist camera - Microdia Webcam Vitade AF
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="6366", TEST=="power/control", ATTR{power/control}="on"
+# top camera - ARC International Camera
+SUBSYSTEM=="usb", ATTR{idVendor}=="05a3", ATTR{idProduct}=="9230", TEST=="power/control", ATTR{power/control}="on"
+# Realtek 4-port USB2 hub (Orin carrier board, 1-4) - a suspended hub takes its children with it
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="5420", TEST=="power/control", ATTR{power/control}="on"
+# VIA 4-port USB2 hub (1-4.1)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2109", ATTR{idProduct}=="2817", TEST=="power/control", ATTR{power/control}="on"

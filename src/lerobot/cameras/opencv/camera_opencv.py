@@ -120,6 +120,10 @@ class OpenCVCamera(Camera):
         self.rotation: int | None = get_cv2_rotation(config.rotation)
         self.backend: int = config.backend
 
+        # Set while the read thread is reopening a device that dropped off the bus, so that
+        # `is_connected` (and therefore `read_latest`) does not fail during the gap.
+        self._reconnecting: bool = False
+
         if self.height and self.width:
             self.capture_width, self.capture_height = self.width, self.height
             if self.rotation in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
@@ -130,7 +134,14 @@ class OpenCVCamera(Camera):
 
     @property
     def is_connected(self) -> bool:
-        """Checks if the camera is currently connected and opened."""
+        """Checks if the camera is currently connected and opened.
+
+        Stays True while the read thread is reopening a device that dropped off the bus,
+        so that a transient USB dropout surfaces as a stale frame rather than as a
+        `DeviceNotConnectedError` from every accessor.
+        """
+        if self._reconnecting:
+            return True
         return isinstance(self.videocapture, cv2.VideoCapture) and self.videocapture.isOpened()
 
     @check_if_already_connected
@@ -434,12 +445,13 @@ class OpenCVCamera(Camera):
         2. Stores result in latest_frame and updates timestamp (thread-safe)
         3. Sets new_frame_event to notify listeners
 
-        Stops on DeviceNotConnectedError, logs other errors and continues.
+        Retries failed reads and device reopens within the recovery budget.
         """
         if self.stop_event is None:
             raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
 
         failure_count = 0
+        recovery_deadline: float | None = None
         while not self.stop_event.is_set():
             try:
                 raw_frame = self._read_from_hardware()
@@ -450,16 +462,85 @@ class OpenCVCamera(Camera):
                     self.latest_frame = processed_frame
                     self.latest_timestamp = capture_time
                 self.new_frame_event.set()
+                if recovery_deadline is not None:
+                    logger.info(f"{self} recovered after a dropout.")
                 failure_count = 0
+                recovery_deadline = None
+                self._reconnecting = False
 
-            except DeviceNotConnectedError:
-                break
             except Exception as e:
-                if failure_count <= 10:
+                if failure_count < self.config.max_read_failures:
                     failure_count += 1
                     logger.warning(f"Error reading frame in background thread for {self}: {e}")
-                else:
-                    raise RuntimeError(f"{self} exceeded maximum consecutive read failures.") from e
+                    continue
+
+                # Reads keep failing. A USB camera that dropped off the bus re-enumerates
+                # after ~1s, so try to reopen it rather than killing the thread outright.
+                # The budget is a deadline, not an attempt count: a dead device fails reads
+                # instantly, so counting attempts would burn the whole budget in milliseconds.
+                now = time.perf_counter()
+                if recovery_deadline is None:
+                    recovery_deadline = now + self.config.reconnect_timeout_s
+                    self._reconnecting = True
+                    logger.warning(
+                        f"{self} stopped delivering frames; will try to reopen it for up to "
+                        f"{self.config.reconnect_timeout_s:.1f}s: {e}"
+                    )
+                elif now >= recovery_deadline:
+                    self._reconnecting = False
+                    raise RuntimeError(
+                        f"{self} exceeded maximum consecutive read failures and did not "
+                        f"recover within {self.config.reconnect_timeout_s:.1f}s."
+                    ) from e
+
+                self._reopen_capture()
+                # Always back off, whether or not the reopen reported success: the device
+                # may be mid re-enumeration and reopen "succeeding" on a stale node.
+                if self.stop_event.wait(self.config.reconnect_backoff_s):
+                    break
+
+        self._reconnecting = False
+
+    def _reopen_capture(self) -> bool:
+        """Release and reopen the underlying VideoCapture after a device dropout.
+
+        Returns True if the device was reopened and reconfigured. The previously captured
+        frame is deliberately left in place so `read_latest` can keep serving it (subject to
+        `max_frame_age_ms`) while the device is away.
+        """
+        was_reconnecting = self._reconnecting
+        self._reconnecting = True
+        try:
+            if self.videocapture is not None:
+                try:
+                    self.videocapture.release()
+                except Exception:
+                    logger.debug(f"{self}: releasing the stale VideoCapture failed.", exc_info=True)
+                self.videocapture = None
+
+            try:
+                videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+            except Exception:
+                logger.debug(f"{self}: reopening the device raised.", exc_info=True)
+                return False
+
+            if not videocapture.isOpened():
+                videocapture.release()
+                return False
+
+            self.videocapture = videocapture
+            try:
+                self._configure_capture_settings()
+            except Exception as e:
+                # The device is back but rejected the requested format; drop it and retry.
+                logger.warning(f"{self}: reopened but failed to reapply capture settings: {e}")
+                videocapture.release()
+                self.videocapture = None
+                return False
+
+            return True
+        finally:
+            self._reconnecting = was_reconnecting
 
     def _start_read_thread(self) -> None:
         """Starts or restarts the background read thread if it's not running."""
@@ -530,12 +611,16 @@ class OpenCVCamera(Camera):
         return frame
 
     @check_if_not_connected
-    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
+    def read_latest(self, max_age_ms: int | None = None) -> NDArray[Any]:
         """Return the most recent frame captured immediately (Peeking).
 
         This method is non-blocking and returns whatever is currently in the
         memory buffer. The frame may be stale,
         meaning it could have been captured a while ago (hanging camera scenario e.g.).
+
+        Args:
+            max_age_ms: Staleness tolerance. Defaults to the camera's
+                        `max_frame_age_ms` config value when not given.
 
         Returns:
             NDArray[Any]: The frame image (numpy array).
@@ -545,6 +630,8 @@ class OpenCVCamera(Camera):
             DeviceNotConnectedError: If the camera is not connected.
             RuntimeError: If the camera is connected but has not captured any frames yet.
         """
+        if max_age_ms is None:
+            max_age_ms = self.config.max_frame_age_ms
 
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")

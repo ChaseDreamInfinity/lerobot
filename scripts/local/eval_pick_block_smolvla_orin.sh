@@ -32,20 +32,38 @@ cd /home/nvidia/Workspace/lerobot
 
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
-POLICY_PATH="${POLICY_PATH:-chasedreaminf/smolvla_so101-pick-block-in-cup-2cam-run1-v2}"
+#POLICY_PATH="${POLICY_PATH:-chasedreaminf/smolvla_so101-pick-block-in-cup-2cam-run1-v2}"
+POLICY_PATH="${POLICY_PATH:-chasedreaminf/smolvla_so101-pick-color-block-in-cup-2cam-run2-v3}"
 ROBOT_PORT="${ROBOT_PORT:-/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A68008652-if00}"
 ROBOT_ID="${ROBOT_ID:-my_follower}"
-WRIST_CAMERA="${WRIST_CAMERA:-/dev/video0}"
-TOP_CAMERA="${TOP_CAMERA:-/dev/video2}"
+# Cameras default to /dev/v4l/by-path/... rather than /dev/videoN: the numbering
+# reshuffles whenever a camera re-enumerates, and this rig's wrist camera does that
+# under load. by-path is tied to the physical USB port, so the wrist/top roles stay put.
+#   wrist -> Orin port 4.4 (Microdia 0c45:6366)
+#   top   -> Orin port 4.1 (ARC 05a3:9230)
+WRIST_CAMERA="${WRIST_CAMERA:-/dev/v4l/by-path/platform-3610000.usb-usb-0:4.4:1.0-video-index0}"
+TOP_CAMERA="${TOP_CAMERA:-/dev/v4l/by-path/platform-3610000.usb-usb-0:4.1:1.0-video-index0}"
 DEVICE="${DEVICE:-cuda}"
 FPS="${FPS:-20}"
 CAMERA_WIDTH="${CAMERA_WIDTH:-640}"
 CAMERA_HEIGHT="${CAMERA_HEIGHT:-480}"
 CAMERA_FPS="${CAMERA_FPS:-30}"
+# Both cameras default to CAMERA_FPS (30); override either rate independently.
+WRIST_CAMERA_FPS="${WRIST_CAMERA_FPS:-${CAMERA_FPS}}"
+TOP_CAMERA_FPS="${TOP_CAMERA_FPS:-${CAMERA_FPS}}"
+# Dropout tolerance. This rig's wrist camera intermittently falls off the USB bus and
+# re-enumerates in ~1s. The camera read thread reopens the device instead of dying, and
+# read_latest() keeps serving the last frame during the gap -- so a rollout rides out a
+# dropout on a stale wrist image rather than crashing. Note the policy IS being fed a
+# stale frame for up to this long, so keep it tight; set to 500 (the library default) to
+# make dropouts fatal again.
+CAMERA_MAX_FRAME_AGE_MS="${CAMERA_MAX_FRAME_AGE_MS:-2000}"
+CAMERA_RECONNECT_TIMEOUT_S="${CAMERA_RECONNECT_TIMEOUT_S:-5.0}"
 CAMERA_FOURCC="${CAMERA_FOURCC:-MJPG}"
 INFERENCE_TYPE="${INFERENCE_TYPE:-rtc}"
 INTERPOLATION_MULTIPLIER="${INTERPOLATION_MULTIPLIER:-1}"
 NUM_ACTION_STEPS="${NUM_ACTION_STEPS:-50}"
+NUM_STEPS="${NUM_STEPS:-10}"
 RTC_EXECUTION_HORIZON="${RTC_EXECUTION_HORIZON:-10}"
 RTC_ENABLED="${RTC_ENABLED:-true}"
 RTC_QUEUE_THRESHOLD="${RTC_QUEUE_THRESHOLD:-22}"
@@ -68,18 +86,14 @@ fi
 for camera in "${WRIST_CAMERA}" "${TOP_CAMERA}"; do
   if [[ ! -e "${camera}" ]]; then
     echo "Camera not found: ${camera}" >&2
-    echo "Check available cameras with: ls -l /dev/video*" >&2
+    echo "Check available cameras with: ls -l /dev/v4l/by-path/ /dev/video*" >&2
     exit 1
   fi
 done
 
-if [[ "${DEVICE}" == cuda* ]]; then
-  uv run --no-sync python -c "import torch; raise SystemExit(0 if torch.cuda.is_available() else 1)" || {
-    echo "CUDA was requested with DEVICE=${DEVICE}, but PyTorch cannot access CUDA." >&2
-    echo "Verify with: UV_CACHE_DIR=${UV_CACHE_DIR} uv run --no-sync python -c 'import torch; print(torch.cuda.is_available())'" >&2
-    exit 1
-  }
-fi
+# shellcheck source=scripts/local/_cuda_guard.sh
+source scripts/local/_cuda_guard.sh
+require_cuda "${DEVICE}"
 
 args=(
   uv run --no-sync lerobot-rollout
@@ -88,12 +102,13 @@ args=(
   --robot.port="${ROBOT_PORT}" \
   --robot.id="${ROBOT_ID}" \
   --robot.cameras="{
-    wrist: {type: opencv, index_or_path: \"${WRIST_CAMERA}\", width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: ${CAMERA_FOURCC}},
-    top:   {type: opencv, index_or_path: \"${TOP_CAMERA}\", width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${CAMERA_FPS}, fourcc: ${CAMERA_FOURCC}}
+    wrist: {type: opencv, index_or_path: \"${WRIST_CAMERA}\", width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${WRIST_CAMERA_FPS}, fourcc: ${CAMERA_FOURCC}, max_frame_age_ms: ${CAMERA_MAX_FRAME_AGE_MS}, reconnect_timeout_s: ${CAMERA_RECONNECT_TIMEOUT_S}},
+    top:   {type: opencv, index_or_path: \"${TOP_CAMERA}\", width: ${CAMERA_WIDTH}, height: ${CAMERA_HEIGHT}, fps: ${TOP_CAMERA_FPS}, fourcc: ${CAMERA_FOURCC}, max_frame_age_ms: ${CAMERA_MAX_FRAME_AGE_MS}, reconnect_timeout_s: ${CAMERA_RECONNECT_TIMEOUT_S}}
   }" \
   --strategy.type=base \
   --inference.type="${INFERENCE_TYPE}" \
   --policy.n_action_steps="${NUM_ACTION_STEPS}" \
+  --policy.num_steps="${NUM_STEPS}" \
   --task="${TASK}" \
   --fps="${FPS}" \
   --interpolation_multiplier="${INTERPOLATION_MULTIPLIER}" \
