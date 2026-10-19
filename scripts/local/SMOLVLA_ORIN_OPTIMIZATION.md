@@ -291,7 +291,8 @@ stream sync.
   ~29 ms of steps (10 × 2.9).
 - **Next levers:**
   - **An fp16-safe KV fill** (find the overflowing layers): −5 ms.
-  - **INT8 expert weights:** the step is memory-bound, so up to ~−15 ms.
+  - **INT8 expert weights:** the step is memory-bound, so up to ~−15 ms. (Measured later: it is
+    kernel-count-bound, and INT8 saves at most ~2.6 ms; see the INT8 / INT4 entry.)
   - Either way, about 75 → 55–70 ms.
 - **What it would mean on the robot:** at 30 Hz, 75 ms is a delay of about 3 ticks against today's
   4. Integrating it would mean engines per checkpoint and a rewrite of the RTC loop around a
@@ -354,10 +355,86 @@ Real `lerobot-rollout` loop at 30 Hz with RTC, the real cameras and a stand-in a
 | 10 steps | 10 × 2.86 ms |
 
 **Remaining levers:**
-- **INT8 weights for the step engine:** it runs at 2.4× its fp16 memory floor.
+- **INT8 weights for the step engine:** it runs at 2.4× its fp16 memory floor. Tried next: no
+  useful gain (see below).
 - **INT8 or FP8-style vision:** compute-bound, with accuracy risk.
 - **Fewer flow steps:** this changes the policy, so it is an accuracy decision, not an
   optimization.
+
+### 2026-10-19 — INT8 / INT4 step engine: not worth it
+
+The question: does quantizing the step's ~100M projection weights (200 MB in fp16) speed it up?
+`scripts/local/smolvla_step_quant_probe.py` rewrites the step ONNX for each variant, and each one
+was timed with `trtexec --useCudaGraph`. The activation scales are placeholders, which doesn't
+change speed.
+
+| Step engine variant | Engine size | Step time | Notes |
+|---|---|---|---|
+| fp16 (current) | 201 MB | 2.86–2.90 ms | stable across builds |
+| fp16, `--builderOptimizationLevel=5` | 201 MB | 2.78 ms | |
+| INT8 weight-only (per channel) | 201 MB | 2.85 ms | TensorRT 10.3 folds the dequantize into fp16 constants: no INT8 layers |
+| INT4 weight-only (blocks of 128) | 57 MB | 4.5–4.6 ms | real INT4, but the dequantizing GEMMs are slower |
+| W8A8 (INT8 weights and inputs) | 115 MB | 2.57 or 2.97 ms | bimodal across builds |
+| W8A8, MLP only | | 2.85–2.99 ms | |
+| W8A8, `--builderOptimizationLevel=5` | 115 MB | 2.52 ms | best case |
+
+**Why it doesn't pay off:** the step isn't bound by weight bandwidth. It runs ~610 kernels in
+2.86 ms, about 4.7 µs each, so the time goes mostly to launching and finishing many small
+kernels. At 50 tokens even the fp16 GEMMs reach only ~65 GB/s, and the non-GEMM kernels (norms,
+rotary embedding, masks, the per-layer K/V concat) are about half the kernel time. INT8 does
+halve the MLP GEMM (the fused gate+up drops from ~0.096 ms to 0.05 ms), but the added
+quantize/dequantize work nearly cancels it.
+
+**Decision:** not integrated. The best case, W8A8 against tuned fp16, saves 0.26 ms × 10 steps ≈
+2.6 ms per prediction (~4%). The RTC delay stays at 3 ticks, and the gain would need activation
+calibration, an accuracy check, and picking the faster of several builds.
+
+**What would move the step:** fewer kernels per layer, not fewer weight bytes. For example, the
+attention masks depend only on the prefix and could be computed once per prediction instead of
+in every step, and the per-layer concat of prefix and suffix K/V could be avoided. (Tried next:
+kernel count was not the bottleneck either; see below.)
+
+### 2026-10-19 — fewer operations per step: near the floor already
+
+`scripts/local/smolvla_lean_step_study.py` rewrites the step export without changing its math.
+It is checked bit-exact (difference 0.0 in fp32 and in fp16) against the model's own step:
+- **Cross-attention K/V projection moved out of the step:** the 8 cross-attention layers
+  re-projected the 241 prefix keys and values through the expert's `k_proj`/`v_proj` (fp32
+  weights) in every step, though they depend only on the prefix. Done once per prediction
+  instead, with the same tensor shapes.
+- **Grouped-query attention without the K/V head expansion:** the query heads are grouped
+  instead of materializing 15-head copies of the 5-head K/V.
+- **RoPE:** tables are computed once per step, and a concat replaces the slice assignment that
+  produced 48 `ScatterND` ops.
+
+| Step engine | Kernels | Step time |
+|---|---|---|
+| fp16 (current) | 610 | 2.86 ms |
+| Lean fp16 | 374 | 2.74 ms |
+| Lean fp16, suffix padded to 56 / 64 tokens | | 2.87 / 2.94 ms |
+| Lean fp16, `--builderOptimizationLevel=5` | | 2.76 ms |
+| Lean + W8A8, `--builderOptimizationLevel=5` | | 2.50 or 2.88 ms (bimodal) |
+
+**Why so little:** 39% fewer kernels saved only 4%. Inside a CUDA graph, launch overhead is
+small; the time goes to reading weights. Measured on this Orin:
+- **Bandwidth:** a 200 MB device copy reaches **~120 GB/s** (not the ~200 GB/s spec). That puts
+  the floor for reading the 200 MB of fp16 weights once at **~1.7 ms per step**.
+- **GEMMs alone:** the step's 112 weight GEMMs take 2.36 ms in cuBLAS at 50 tokens, but 1.89 ms
+  at 56–64 tokens. TensorRT's own kernel tuning doesn't share this cliff: padding the suffix
+  doesn't help there.
+- **The rest:** the lean step is ~1.6× the bandwidth floor. The gap is GEMM efficiency at 50 rows
+  plus ~0.5 ms of attention and norms.
+
+**Per prediction:** 10 steps × 0.12 ms = **~1.2 ms** for the lean fp16 step (once-per-prediction
+projection not yet subtracted), or ~3.6 ms with W8A8 at its best build. Delay ticks are what
+matter on the robot. The real loop measures 69–71 ms, and ≤ 66.7 ms would cut the RTC delay from
+3 ticks to 2. So 1.2 ms changes nothing, and 3.6 ms only reaches the edge, at the cost of
+calibration, an accuracy check and choosing among bimodal builds. Not integrated.
+
+**Where the other ~10 ms of the real loop goes**, if crossing 66.7 ms is the target: offline
+sampling is ~60 ms, against 69–71 ms in the rollout loop. Preprocessing and the hand-off around
+`predict_action_chunk` are the next things to measure. The vision engine (18 ms) is the largest
+single block.
 
 ### Next
 
@@ -365,10 +442,11 @@ Real `lerobot-rollout` loop at 30 Hz with RTC, the real cameras and a stand-in a
 
 | Configuration | Command | Attempts | Successes | Notes |
 |---|---|---|---|---|
-| CUDA graphs, brown block | `eval_pick_block_smolvla_orin.sh --cuda-graph` | | | first run with correct cameras |
-| CUDA graphs, green block | `TASK="pick up the green block …" … --cuda-graph` | | | checks language conditioning |
+| TensorRT, brown block | `eval_pick_block_smolvla_orin.sh --trt` | | | first run with correct cameras |
+| TensorRT, green block | `TASK="pick up the green block …" … --trt` | | | checks language conditioning |
 
-Remaining speed-up lead: see the upper-bound study above.
+Remaining speed-up lead: the ~10 ms between offline sampling (~60 ms) and the rollout loop
+(69–71 ms). Getting under 66.7 ms would cut the RTC delay to 2 ticks; see the per-step entry above.
 
 ## How the speed-up works
 
