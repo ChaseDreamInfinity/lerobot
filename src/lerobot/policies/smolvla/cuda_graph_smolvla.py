@@ -22,11 +22,15 @@ Two graphs are captured per prefix shape, on first use:
 - the prefix KV-cache fill (the VLM pass over image, language and state tokens);
 - one denoising step of the action expert, reading that KV cache in place.
 
-Image and language embedding (``embed_prefix``) stays eager: the SigLIP embeddings in
-``transformers`` use boolean-mask indexing, which syncs with the host. The denoising loop also
-stays in Python, so Real-Time Chunking guidance works unchanged: it calls the graphed step as its
-denoiser. (Its correction does not differentiate through the network, since ``v_t`` is computed
-before ``x_t`` requires grad, so a replayed ``v_t`` gives the same result.)
+Image encoding stays eager: it is GPU-bound (~14.5 ms per 512x512 image graphed vs ~16 ms eager),
+and ``transformers``' SigLIP embeddings would need patching to be capturable. Empty camera slots,
+the constant image ``prepare_images`` pads missing cameras with, are encoded once and cached
+(saving one image encode per prediction). Each image is compared with the constant on the device,
+so the cache is only used for an input identical to the one it was computed from.
+
+The denoising loop stays in Python, so Real-Time Chunking guidance works unchanged: it calls the
+graphed step as its denoiser. (Its correction does not differentiate through the network, since
+``v_t`` is computed before ``x_t`` requires grad, so a replayed ``v_t`` gives the same result.)
 
 Only batch size 1 is graphed; anything else runs the original eager code.
 """
@@ -56,6 +60,28 @@ def _capture(fn: Callable[[], object], pool=None) -> tuple[torch.cuda.CUDAGraph,
     with torch.cuda.graph(graph, pool=pool):
         output = fn()
     return graph, output
+
+
+class _ConstantImageCache:
+    """Stands in for ``SmolVLMWithExpertModel.embed_image``, caching embeddings of constant inputs.
+
+    Constants are matched by tensor identity: callers swap an input for the registered tensor only
+    after checking the values are equal.
+    """
+
+    def __init__(self, embed_image: Callable[[Tensor], Tensor]):
+        self.embed_image = embed_image
+        self.constants: dict[int, tuple[Tensor, Tensor]] = {}
+
+    def __call__(self, image: Tensor) -> Tensor:
+        constant = self.constants.get(id(image))
+        if constant is not None and constant[0] is image:
+            return constant[1]
+        return self.embed_image(image)
+
+    def register(self, image: Tensor) -> None:
+        if id(image) not in self.constants:
+            self.constants[id(image)] = (image, self.embed_image(image))
 
 
 class _PrefixGraphs:
@@ -117,6 +143,25 @@ class GraphedSampler:
         self.model = model
         self.eager = model.sample_actions
         self._graphs: dict[tuple, _PrefixGraphs] = {}
+        self._empty_images: dict[tuple, Tensor] = {}
+
+        self.image_cache = _ConstantImageCache(model.vlm_with_expert.embed_image)
+        model.vlm_with_expert.embed_image = self.image_cache
+
+    def _with_cached_constants(self, images: list[Tensor]) -> list[Tensor]:
+        """Swap images equal to the empty-slot constant for one registered object, so their
+        embedding comes from the cache. The comparison is exact, so only identical inputs hit it."""
+        out = []
+        for image in images:
+            key = (tuple(image.shape), image.dtype, image.device)
+            if key not in self._empty_images:
+                with torch.inference_mode(False):
+                    empty = torch.full(image.shape, -1.0, dtype=image.dtype, device=image.device)
+                self.image_cache.register(empty)
+                self._empty_images[key] = empty
+            empty = self._empty_images[key]
+            out.append(empty if torch.equal(image, empty) else image)
+        return out
 
     @torch.no_grad()
     def __call__(self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs) -> Tensor:
@@ -130,6 +175,7 @@ class GraphedSampler:
         if noise is None:
             noise = model.sample_noise((bsize, config.chunk_size, config.max_action_dim), device)
 
+        images = self._with_cached_constants(images)
         prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )

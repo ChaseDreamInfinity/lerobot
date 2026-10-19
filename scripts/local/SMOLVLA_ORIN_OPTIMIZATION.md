@@ -25,7 +25,7 @@ DURATION=30 bash scripts/local/eval_pick_block_smolvla_orin.sh --cuda-graph --dr
 - **Inference latency:** logged by the RTC engine every 10 predictions:
 
   ```
-  RTC inference: latency last 142 ms, max of last 20 165 ms | delay 5 ticks | queue 45
+  RTC inference: latency last 127 ms, max of last 20 143 ms | delay 4 ticks | queue 46
   ```
 
   - **delay:** how many ticks passed while the chunk was computed. Those actions are already in
@@ -150,6 +150,68 @@ The control loop is fine either way, because inference runs in the background. W
 how fresh the actions are: with graphs the policy reacts to what the cameras saw about 0.14 s
 earlier instead of 0.9 s, and keeps 45 of each 50 actions instead of 23.
 
+### 2026-10-19 — how far can it go? Upper-bound study
+
+Where the 128 ms went, against a published TensorRT implementation and a hardware floor:
+
+| Part | Ours (CUDA graphs) | EdgeVLA-TRT, fp16 | Hardware floor, fp16 |
+|---|---|---|---|
+| Image encoding | 48 ms: 3 × 16 ms, eager, including the empty slot | 33.5 ms (2 images) | ~12 ms (2 × 6.1) |
+| Prefix / KV-cache fill | 13.9 ms | 9.6 ms | ~2.4 ms |
+| 10 denoising steps | 65 ms (6.5 per step) | 40.4 ms (4.0 per step) | ~12 ms (1.17 per step) |
+| **Whole prediction** | **128 ms** | **83 ms** | **~27 ms** |
+
+- **How the floor is worked out:** it assumes perfect kernels. Weights are read at the measured
+  168 GB/s memory bandwidth (expert 196 MB, VLM 409 MB), and the vision encoder needs ~177 GFLOP
+  per image at the measured 29 TFLOPS bf16. INT8 weights would roughly halve the memory-bound parts.
+- **What EdgeVLA-TRT is:** a community fork of NVIDIA TensorRT Edge-LLM that runs on JetPack 6.2.
+  Its 83 ms comes from its design notes: a C++ runtime, an SO-101 SmolVLA checkpoint with the same
+  architecture, 2 cameras, 10 steps. Its LIBERO table reports 122 ms through a Python server.
+- **What EdgeVLA-TRT needs:**
+  - custom TensorRT plugins
+  - CuTe-DSL attention kernels
+  - a CUDA 12.9 runtime library swapped in
+  - a separate CPU-only torch for export
+- **Official TensorRT Edge-LLM:** it supports Orin only on JetPack 7.2, and lists LLMs and VLMs,
+  not SmolVLA.
+
+**Two changes tried:**
+1. **Cache the empty camera slot: kept.** `prepare_images` pads the missing third camera with a
+   constant image (all −1), and SigLIP was encoding it on every prediction. Its embedding is now
+   computed once. Each image is compared with the constant on the GPU (0.36 ms for 3 images), so
+   only an identical input uses the cache. Saves one 16 ms image encode per prediction.
+2. **CUDA-graph the vision encoder: dropped.** It worked and was exact, but saved only ~1.6 ms per
+   image: 14.5 ms graphed against 16.1 ms eager, because the ~1,000-token attention at 512×512 is
+   real GPU work. For comparison, EdgeVLA-TRT's vision engine takes ~16.7 ms per image. Capture
+   also needed a copy of `transformers`' SigLIP embedding code with `torch.where` in place of
+   boolean-mask indexing, which could silently diverge on a `transformers` upgrade. Not worth
+   ~3 ms.
+
+**Two lessons from the vision-graph attempt:**
+- **Keep every graph input referenced.** The patch mask was held only by the lambda passed to the
+  capture. Once the lambda was garbage-collected, the mask's memory was freed while the graph kept
+  reading it. Results were exact until something else, here loading a second model, reused that
+  memory. Then they were wrong by tens of units.
+- **Watch for graph-only mask paths.** `transformers` skips an all-true attention mask on the host
+  in eager mode, but materializes it under capture. That runs a different SDPA kernel, which is
+  equal in exact arithmetic but not bitwise in bf16. Calling the encoder with
+  `attention_mask=None` keeps the eager kernel.
+
+**Result:** outputs are bit-identical to eager PyTorch, with and without RTC.
+
+| | Before | After |
+|---|---|---|
+| One prediction, RTC (offline) | 131 ms | **115 ms** |
+| Real loop at 30 Hz: RTC inference | 142 ms | **127 ms** (max 143) |
+| RTC delay | 5 ticks | **4 ticks** |
+
+**What is left:**
+- **Denoising steps: 65 ms against TensorRT's 40.** The remaining gap is kernel fusion, and
+  closing it would need a TensorRT export of the expert with a 16-layer KV cache.
+- **Image encoding: 32 ms.** Already about as fast as TensorRT.
+- **Effect on the robot:** the denoising gain would take the delay from 4 ticks to 3, so a
+  TensorRT export is not worth its cost on this board for now.
+
 ### Next
 
 **Robot trials** with the fixed camera mapping, at 30 Hz:
@@ -159,16 +221,13 @@ earlier instead of 0.9 s, and keeps 45 of each 50 actions instead of 23.
 | CUDA graphs, brown block | `eval_pick_block_smolvla_orin.sh --cuda-graph` | | | first run with correct cameras |
 | CUDA graphs, green block | `TASK="pick up the green block …" … --cuda-graph` | | | checks language conditioning |
 
-Remaining speed-up lead:
-- **Image + text embedding, about 50 ms of the 131.** The SigLIP vision tower runs 3 times, once
-  per image slot, including the empty slot, whose output is constant. Capturing it needs either
-  replacing the boolean-mask indexing in the `transformers` vision embeddings with a
-  `torch.where` equivalent, or caching the empty slot's embedding.
+Remaining speed-up lead: see the upper-bound study above.
 
 ## How the speed-up works
 
 - **Opt-in flag:** `lerobot-rollout --cuda_graph=true` (SmolVLA only) replaces
-  `VLAFlowMatching.sample_actions` with a graphed version. The code is in
+  `VLAFlowMatching.sample_actions` with a graphed version, and wraps
+  `SmolVLMWithExpertModel.embed_image` with the empty-slot cache. The code is in
   `src/lerobot/policies/smolvla/cuda_graph_smolvla.py`.
 - **Captured at startup:** the graphs are captured before the robot moves, from a dummy prediction
   with the same number of camera images. This matters for RTC, whose delay estimate uses the
@@ -183,7 +242,7 @@ Remaining speed-up lead:
 
 `tests/policies/smolvla/test_smolvla_cuda_graph.py` uses a small randomly initialized SmolVLA:
 - graphed sampling matches eager, with and without RTC, across fresh inputs
-- the graphs are captured once
+- the graphs are captured once, and the empty camera slot is encoded once
 - other batch sizes run eagerly
 - non-SmolVLA policies are rejected
 

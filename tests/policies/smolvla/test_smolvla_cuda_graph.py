@@ -68,8 +68,9 @@ def sample_inputs(policy, seed: int):
 def test_graphed_sampling_matches_eager(rtc):
     from lerobot.policies.smolvla.cuda_graph_smolvla import GraphedSampler, enable_cuda_graphs
 
+    reference = make_policy(rtc)  # same seed: same weights, stays fully eager
     policy = make_policy(rtc)
-    eager = policy.model.sample_actions
+    eager = reference.model.sample_actions
     sampler = enable_cuda_graphs(policy, present_image_keys=CAMERAS)
     assert isinstance(policy.model.sample_actions, GraphedSampler)
     assert len(sampler._graphs) == 1  # captured up front, from the dummy prediction
@@ -85,6 +86,7 @@ def test_graphed_sampling_matches_eager(rtc):
         actual = policy.model.sample_actions(*inputs, noise=noise, **kwargs)
         torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
     assert len(sampler._graphs) == 1  # no recapture for the same prefix shape
+    assert len(sampler.image_cache.constants) == 1  # the padded empty-camera slot is encoded once
 
 
 @skip_if_package_missing("transformers")
@@ -93,8 +95,9 @@ def test_graphed_sampling_matches_eager(rtc):
 def test_other_batch_sizes_run_eagerly():
     from lerobot.policies.smolvla.cuda_graph_smolvla import enable_cuda_graphs
 
+    reference = make_policy(rtc=False)
     policy = make_policy(rtc=False)
-    eager = policy.model.sample_actions
+    eager = reference.model.sample_actions
     sampler = enable_cuda_graphs(policy)  # lazy: nothing captured yet
     (images, img_masks, lang_tokens, lang_masks, state), noise = sample_inputs(policy, 0)
     batched = (
