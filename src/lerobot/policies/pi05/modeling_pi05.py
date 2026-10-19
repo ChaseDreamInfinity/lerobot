@@ -371,7 +371,7 @@ class PaliGemmaWithExpertModel(
         vlm_config_hf.text_config.adarms_cond_dim = vlm_config.width if use_adarms[0] else None
         vlm_config_hf.vision_config.image_size = image_size
         vlm_config_hf.vision_config.intermediate_size = 4304
-        vlm_config_hf.vision_config.projection_dim = 2048
+        vlm_config_hf.vision_config.projection_dim = vlm_config.width  # image tokens join the text stream
         vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
         vlm_config_hf.vision_config.dtype = "float32"
 
@@ -969,54 +969,49 @@ class PI05Policy(PreTrainedPolicy):
                 **kwargs,
             )
 
+        # Load state dict (expects keys with "model." prefix)
+        print(f"Loading model from: {pretrained_name_or_path}")
+        try:
+            from transformers.utils import cached_file
+
+            resolved_file = cached_file(
+                pretrained_name_or_path,
+                "model.safetensors",
+                cache_dir=kwargs.get("cache_dir"),
+                force_download=kwargs.get("force_download", False),
+                resume_download=kwargs.get("resume_download"),
+                proxies=kwargs.get("proxies"),
+                token=kwargs.get("token"),
+                revision=kwargs.get("revision"),
+                local_files_only=kwargs.get("local_files_only", False),
+            )
+            from safetensors.torch import load_file
+
+            original_state_dict = load_file(resolved_file)
+            print("✓ Loaded state dict from model.safetensors")
+        except Exception as e:
+            print(f"Could not load state dict from remote files: {e}")
+            print("Returning model without loading pretrained weights")
+            return cls(config, **kwargs)
+
+        # Every parameter is about to be overwritten by the checkpoint, so build the model without
+        # random initialization: on a Jetson Orin's CPU it took ~207 s of a ~213 s load. Only a
+        # checkpoint that covers every parameter keeps this model; otherwise it is rebuilt below.
+        from transformers.initialization import no_init_weights
+
+        with no_init_weights():
+            model = cls(config, **kwargs)
+        remapped_state_dict = model._remap_state_dict(original_state_dict)
+        missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+        if not missing_keys and not unexpected_keys:
+            print("All keys loaded successfully!")
+            return model
+
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
         model = cls(config, **kwargs)
 
-        # Load state dict (expects keys with "model." prefix)
         try:
-            print(f"Loading model from: {pretrained_name_or_path}")
-            try:
-                from transformers.utils import cached_file
-
-                resolved_file = cached_file(
-                    pretrained_name_or_path,
-                    "model.safetensors",
-                    cache_dir=kwargs.get("cache_dir"),
-                    force_download=kwargs.get("force_download", False),
-                    resume_download=kwargs.get("resume_download"),
-                    proxies=kwargs.get("proxies"),
-                    token=kwargs.get("token"),
-                    revision=kwargs.get("revision"),
-                    local_files_only=kwargs.get("local_files_only", False),
-                )
-                from safetensors.torch import load_file
-
-                original_state_dict = load_file(resolved_file)
-                print("✓ Loaded state dict from model.safetensors")
-            except Exception as e:
-                print(f"Could not load state dict from remote files: {e}")
-                print("Returning model without loading pretrained weights")
-                return model
-
-            # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
-            fixed_state_dict = model._fix_pytorch_state_dict_keys(original_state_dict, model.config)
-
-            # Then add "model." prefix for all keys that don't already have it
-            remapped_state_dict = {}
-            remap_count = 0
-
-            for key, value in fixed_state_dict.items():
-                if not key.startswith("model."):
-                    new_key = f"model.{key}"
-                    remapped_state_dict[new_key] = value
-                    remap_count += 1
-                else:
-                    remapped_state_dict[key] = value
-
-            if remap_count > 0:
-                print(f"Remapped {remap_count} state dict keys")
-
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
 
@@ -1047,6 +1042,27 @@ class PI05Policy(PreTrainedPolicy):
             print(f"Warning: Could not load state dict: {e}")
 
         return model
+
+    def _remap_state_dict(self, state_dict):
+        """Checkpoint keys to this model's: fix key differences, then add the "model." prefix."""
+        # First, fix any key differences (see openpi model.py, _fix_pytorch_state_dict_keys)
+        fixed_state_dict = self._fix_pytorch_state_dict_keys(state_dict, self.config)
+
+        # Then add "model." prefix for all keys that don't already have it
+        remapped_state_dict = {}
+        remap_count = 0
+
+        for key, value in fixed_state_dict.items():
+            if not key.startswith("model."):
+                new_key = f"model.{key}"
+                remapped_state_dict[new_key] = value
+                remap_count += 1
+            else:
+                remapped_state_dict[key] = value
+
+        if remap_count > 0:
+            print(f"Remapped {remap_count} state dict keys")
+        return remapped_state_dict
 
     def _fix_pytorch_state_dict_keys(
         self, state_dict, model_config
