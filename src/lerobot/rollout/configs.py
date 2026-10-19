@@ -221,6 +221,14 @@ class RolloutConfig:
     torch_compile_mode: str = "default"
     compile_warmup_inferences: int = 2
 
+    # TensorRT (ACT only): serialized engine that replaces the policy's forward pass. Build one
+    # per checkpoint and device with `python -m lerobot.policies.act.tensorrt_act`.
+    tensorrt_engine: str | None = None
+
+    # Log per-stage control-loop latency (obs, process, policy, send, loop) every N seconds,
+    # plus a whole-run summary at the end. 0 disables it. Base strategy only.
+    latency_log_interval_s: float = 0.0
+
     def __post_init__(self):
         """Validate config invariants and load the policy config from ``--policy.path``."""
         # --- Strategy-specific validation ---
@@ -317,6 +325,17 @@ class RolloutConfig:
             else:
                 self.device = auto_select_torch_device().type
                 logger.info("No policy config to resolve device from; auto-selected device: %s", self.device)
+
+        # --- TensorRT ---
+        if self.tensorrt_engine:
+            if self.policy.type != "act":
+                raise ValueError(f"--tensorrt_engine supports ACT only, got policy type '{self.policy.type}'")
+            if not str(self.device).startswith("cuda"):
+                raise ValueError(f"--tensorrt_engine requires a CUDA device, got '{self.device}'")
+            if not isinstance(self.inference, SyncInferenceConfig):
+                raise ValueError("--tensorrt_engine requires --inference.type=sync")
+            if self.use_torch_compile:
+                raise ValueError("--tensorrt_engine and --use_torch_compile are mutually exclusive")
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:

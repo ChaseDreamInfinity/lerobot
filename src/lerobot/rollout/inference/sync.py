@@ -17,14 +17,17 @@
 from __future__ import annotations
 
 import logging
+import time
 from contextlib import nullcontext
 from copy import copy
 
+import numpy as np
 import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.utils.constants import DEFAULT_FEATURES, OBS_STR
 
 from .base import InferenceEngine
 
@@ -80,8 +83,33 @@ class SyncInferenceEngine(InferenceEngine):
         )
 
     def start(self) -> None:
-        """No background resources to start."""
+        """Warm up the inference pipeline; there are no background resources to start."""
+        self._warmup()
         logger.info("SyncInferenceEngine started (inline mode — no background thread)")
+
+    def _warmup(self) -> None:
+        """Run one throwaway inference so first-call costs are paid before the control loop.
+
+        The first pass through the pipeline pays one-time costs (CUDA kernel loading, moving
+        processor state to the device, allocator growth): ~370 ms for eager ACT on a Jetson
+        Orin, ~20 ms with a TensorRT engine. Paid on the first control tick, that stalls the
+        robot. The dummy frame is all zeros; ``reset`` afterwards discards any actions or
+        observation history it left in the policy.
+        """
+        frame = {}
+        for key, ft in self._dataset_features.items():
+            if key in DEFAULT_FEATURES or not key.startswith(OBS_STR):
+                continue
+            if ft["dtype"] in ("image", "video"):
+                frame[key] = np.zeros(ft["shape"], dtype=np.uint8)
+            elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
+                frame[key] = np.zeros(ft["shape"], dtype=np.float32)
+        start = time.perf_counter()
+        self.get_action(frame)
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+        self.reset()
+        logger.info("Inference warm-up done in %.0f ms", (time.perf_counter() - start) * 1e3)
 
     def stop(self) -> None:
         """No background resources to stop."""

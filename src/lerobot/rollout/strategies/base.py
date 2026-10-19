@@ -22,6 +22,7 @@ import time
 from lerobot.utils.robot_utils import precise_sleep
 
 from ..context import RolloutContext
+from ..latency import LatencyMonitor
 from .core import RolloutStrategy, send_next_action
 
 logger = logging.getLogger(__name__)
@@ -47,34 +48,51 @@ class BaseStrategy(RolloutStrategy):
         interpolator = self._interpolator
 
         control_interval = interpolator.get_control_interval(cfg.fps)
+        latency = (
+            LatencyMonitor(cfg.latency_log_interval_s, 1 / control_interval)
+            if cfg.latency_log_interval_s > 0
+            else None
+        )
 
         start_time = time.perf_counter()
         engine.resume()
         logger.info("Base strategy control loop started")
 
-        while not ctx.runtime.shutdown_event.is_set():
-            loop_start = time.perf_counter()
+        try:
+            while not ctx.runtime.shutdown_event.is_set():
+                loop_start = time.perf_counter()
+                if latency is not None:
+                    latency.start_tick()
 
-            if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
-                logger.info("Duration limit reached (%.0fs)", cfg.duration)
-                break
+                if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
+                    logger.info("Duration limit reached (%.0fs)", cfg.duration)
+                    break
 
-            obs = robot.get_observation()
-            obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                obs = robot.get_observation()
+                if latency is not None:
+                    latency.mark("obs")
+                obs_processed = self._process_observation_and_notify(ctx.processors, obs)
+                if latency is not None:
+                    latency.mark("process")
 
-            if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
-                continue
+                if self._handle_warmup(cfg.use_torch_compile, loop_start, control_interval):
+                    continue
 
-            action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
-            self._log_telemetry(obs_processed, action_dict, ctx.runtime)
+                action_dict = send_next_action(obs_processed, obs, ctx, interpolator, latency)
+                self._log_telemetry(obs_processed, action_dict, ctx.runtime)
+                if latency is not None:
+                    latency.end_tick()
 
-            dt = time.perf_counter() - loop_start
-            if (sleep_t := control_interval - dt) > 0:
-                precise_sleep(sleep_t)
-            else:
-                logger.warning(
-                    f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
-                )
+                dt = time.perf_counter() - loop_start
+                if (sleep_t := control_interval - dt) > 0:
+                    precise_sleep(sleep_t)
+                else:
+                    logger.warning(
+                        f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                    )
+        finally:
+            if latency is not None:
+                latency.log_run_summary()
 
     def teardown(self, ctx: RolloutContext) -> None:
         """Disconnect hardware and stop inference."""

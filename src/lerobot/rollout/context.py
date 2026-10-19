@@ -221,6 +221,11 @@ def build_rollout_context(
         except Exception as e:
             logger.warning("Failed to apply torch.compile: %s", e)
 
+    if cfg.tensorrt_engine:
+        from lerobot.policies.act.tensorrt_act import attach_tensorrt_engine
+
+        attach_tensorrt_engine(policy, cfg.tensorrt_engine)
+
     # --- 2. Robot-side processors (user-supplied or defaults) --------
     if (
         teleop_action_processor is None

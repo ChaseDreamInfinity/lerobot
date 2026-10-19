@@ -343,3 +343,50 @@ def test_rollout_context_fields():
 
     field_names = {f.name for f in dataclasses.fields(RolloutContext)}
     assert field_names == {"runtime", "hardware", "policy", "processors", "data"}
+
+
+# ---------------------------------------------------------------------------
+# Latency monitor
+# ---------------------------------------------------------------------------
+
+
+def test_latency_monitor_logs_window_and_run_summary(monkeypatch, caplog):
+    import logging
+
+    from lerobot.rollout import latency as latency_mod
+
+    clock = [0.0]
+    monkeypatch.setattr(latency_mod.time, "perf_counter", lambda: clock[0])
+    monitor = latency_mod.LatencyMonitor(interval_s=1.0, fps=10)  # 100 ms budget
+
+    def tick(obs_s, policy_s):
+        monitor.start_tick()
+        clock[0] += obs_s
+        monitor.mark("obs")
+        clock[0] += policy_s
+        monitor.mark("policy")
+        monitor.end_tick()
+        clock[0] += 0.1 - obs_s - policy_s if obs_s + policy_s < 0.1 else 0.0
+
+    with caplog.at_level(logging.INFO, logger=latency_mod.__name__):
+        for _ in range(9):
+            tick(0.01, 0.02)
+        monitor.start_tick()  # abandoned tick (e.g. warmup): not recorded
+        tick(0.01, 0.15)  # overruns the budget and closes the 1 s window
+        monitor.log_run_summary()
+
+    window, run = (r.getMessage() for r in caplog.records)
+    assert "10 ticks" in window and "overruns 1 (budget 100.0 ms)" in window
+    assert "obs 10.0/10.0/10.0" in window and "policy 33.0/150.0/150.0" in window
+    assert "loop 43.0/160.0/160.0" in window
+    assert "10 ticks" in run and "policy 33.0/150.0" in run and "overruns 1 (10.0%)" in run
+
+
+def test_latency_monitor_ignores_marks_outside_a_tick():
+    from lerobot.rollout.latency import LatencyMonitor
+
+    monitor = LatencyMonitor(interval_s=60, fps=30)
+    monitor.mark("obs")
+    monitor.end_tick()
+    monitor.log_run_summary()  # nothing recorded: must not raise
+    assert monitor._run == {}

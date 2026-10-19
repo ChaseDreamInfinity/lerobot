@@ -33,6 +33,7 @@ from ..inference import InferenceEngine
 if TYPE_CHECKING:
     from ..configs import RolloutStrategyConfig
     from ..context import HardwareContext, ProcessorContext, RolloutContext, RuntimeContext
+    from ..latency import LatencyMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -271,6 +272,7 @@ def send_next_action(
     obs_raw: dict,
     ctx: RolloutContext,
     interpolator: ActionInterpolator,
+    latency: LatencyMonitor | None = None,
 ) -> dict | None:
     """Dispatch the next action to the robot.
 
@@ -281,6 +283,9 @@ def send_next_action(
 
     Returns the action dict that was sent, or ``None`` if no action was
     ready (e.g. empty async queue, interpolator not yet primed).
+
+    When ``latency`` is given, the policy call and the action send are timed
+    as separate ``policy`` and ``send`` stages.
     """
     engine = ctx.policy.inference
     features = ctx.data.dataset_features
@@ -291,6 +296,8 @@ def send_next_action(
         action_tensor = engine.get_action(obs_frame)
         if action_tensor is not None:
             interpolator.add(action_tensor.cpu())
+    if latency is not None:
+        latency.mark("policy")
 
     interp = interpolator.get()
     if interp is None:
@@ -301,4 +308,6 @@ def send_next_action(
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
     processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
     ctx.hardware.robot_wrapper.send_action(processed)
+    if latency is not None:
+        latency.mark("send")
     return action_dict

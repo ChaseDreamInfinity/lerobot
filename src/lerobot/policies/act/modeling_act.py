@@ -452,20 +452,23 @@ class ACT(nn.Module):
         else:
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
-            # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
+            # Allocate directly on the target device: a host allocation plus copy costs a sync
+            # and makes the forward impossible to capture in a CUDA graph.
+            latent_sample = torch.zeros(
+                [batch_size, self.config.latent_dim], dtype=torch.float32, device=batch[OBS_STATE].device
             )
 
-        # Prepare transformer encoder inputs.
-        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
-        encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+        # Prepare transformer encoder inputs as (sequence, batch, dim) chunks, concatenated once
+        # below. Splitting camera feature maps into one tensor per token costs hundreds of tiny ops
+        # per forward, which dominates latency on launch-bound devices such as Jetson.
+        encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample).unsqueeze(0)]
+        encoder_in_pos_embed = [self.encoder_1d_feature_pos_embed.weight.unsqueeze(1)]
         # Robot state token.
         if self.config.robot_state_feature:
-            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]).unsqueeze(0))
         # Environment state token.
         if self.config.env_state_feature:
-            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+            encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]).unsqueeze(0))
 
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
@@ -480,14 +483,12 @@ class ACT(nn.Module):
                 cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
                 cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
 
-                # Extend immediately instead of accumulating and concatenating
-                # Convert to list to extend properly
-                encoder_in_tokens.extend(list(cam_features))
-                encoder_in_pos_embed.extend(list(cam_pos_embed))
+                encoder_in_tokens.append(cam_features)
+                encoder_in_pos_embed.append(cam_pos_embed)
 
-        # Stack all tokens along the sequence dimension.
-        encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
-        encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+        # Concatenate all tokens along the sequence dimension.
+        encoder_in_tokens = torch.cat(encoder_in_tokens, dim=0)
+        encoder_in_pos_embed = torch.cat(encoder_in_pos_embed, dim=0)
 
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
