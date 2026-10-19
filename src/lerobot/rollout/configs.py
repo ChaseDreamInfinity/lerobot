@@ -228,8 +228,9 @@ class RolloutConfig:
     # (`python -m lerobot.policies.smolvla.tensorrt_smolvla`); works with RTC inference.
     tensorrt_engine: str | None = None
 
-    # CUDA graphs (SmolVLA only): replay the KV-cache fill and each denoising step from CUDA
-    # graphs captured at startup (~6.5x faster sampling on a Jetson Orin; outputs unchanged).
+    # CUDA graphs (SmolVLA and PI0.5): replay the KV-cache fill and each denoising step from CUDA
+    # graphs captured at startup. On a Jetson Orin: SmolVLA ~6.5x faster sampling, outputs
+    # unchanged; PI0.5 ~2.3x, with images encoded in TF32 (relative error ~4e-4).
     cuda_graph: bool = False
 
     # Log per-stage control-loop latency (obs, process, policy, send, loop) every N seconds,
@@ -352,8 +353,10 @@ class RolloutConfig:
 
         # --- CUDA graphs ---
         if self.cuda_graph:
-            if self.policy.type != "smolvla":
-                raise ValueError(f"--cuda_graph supports SmolVLA only, got policy type '{self.policy.type}'")
+            if self.policy.type not in ("smolvla", "pi05"):
+                raise ValueError(
+                    f"--cuda_graph supports SmolVLA and PI0.5, got policy type '{self.policy.type}'"
+                )
             if not str(self.device).startswith("cuda"):
                 raise ValueError(f"--cuda_graph requires a CUDA device, got '{self.device}'")
             if self.use_torch_compile:

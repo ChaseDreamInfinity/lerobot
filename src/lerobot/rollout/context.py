@@ -429,6 +429,10 @@ def build_rollout_context(
             from lerobot.policies.smolvla.tensorrt_smolvla import attach_tensorrt_engines
 
             attach_tensorrt_engines(policy, cfg.tensorrt_engine, present_image_keys=image_keys)
+        elif policy.name == "pi05":
+            from lerobot.policies.pi05.cuda_graph_pi05 import enable_cuda_graphs as enable_pi05_cuda_graphs
+
+            enable_pi05_cuda_graphs(policy, present_image_keys=image_keys)
         else:
             from lerobot.policies.smolvla.cuda_graph_smolvla import enable_cuda_graphs
 

@@ -43,48 +43,11 @@ from collections.abc import Callable
 import torch
 from torch import Tensor
 
+from lerobot.utils.cuda_graph import ConstantImageCache, EmptyImageSlots, capture as _capture
+
 from .modeling_smolvla import SmolVLAPolicy, VLAFlowMatching, make_att_2d_masks
 
 logger = logging.getLogger(__name__)
-
-
-def _capture(fn: Callable[[], object], pool=None) -> tuple[torch.cuda.CUDAGraph, object]:
-    """Warm ``fn`` up on a side stream, then capture it. Returns the graph and ``fn``'s output."""
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        for _ in range(2):
-            fn()
-    torch.cuda.current_stream().wait_stream(stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, pool=pool):
-        output = fn()
-    return graph, output
-
-
-class _ConstantImageCache:
-    """Stands in for ``SmolVLMWithExpertModel.embed_image``, caching embeddings of constant inputs.
-
-    Constants are matched by tensor identity: callers swap an input for the registered tensor only
-    after checking the values are equal.
-    """
-
-    def __init__(self, embed_image: Callable[[Tensor], Tensor]):
-        self.embed_image = embed_image
-        self.constants: dict[int, tuple[Tensor, Tensor]] = {}
-        # Embeddings computed ahead of ``embed_prefix`` for one prediction (batched encoders).
-        self.precomputed: dict[int, tuple[Tensor, Tensor]] = {}
-
-    def __call__(self, image: Tensor) -> Tensor:
-        for table in (self.constants, self.precomputed):
-            hit = table.get(id(image))
-            if hit is not None and hit[0] is image:
-                return hit[1]
-        return self.embed_image(image)
-
-    def register(self, image: Tensor) -> None:
-        if id(image) not in self.constants:
-            self.constants[id(image)] = (image, self.embed_image(image))
 
 
 # Backends for the two graphed stages. ``FillKV(embs, pad_masks, att_masks) -> kv`` builds the
@@ -181,25 +144,10 @@ class GraphedSampler:
         self.denoise = denoise or pytorch_denoise(model)
         self.encode_images = encode_images
         self._graphs: dict[tuple, _PrefixGraphs] = {}
-        self._empty_images: dict[tuple, Tensor] = {}
 
-        self.image_cache = _ConstantImageCache(model.vlm_with_expert.embed_image)
+        self.image_cache = ConstantImageCache(model.vlm_with_expert.embed_image)
         model.vlm_with_expert.embed_image = self.image_cache
-
-    def _with_cached_constants(self, images: list[Tensor]) -> list[Tensor]:
-        """Swap images equal to the empty-slot constant for one registered object, so their
-        embedding comes from the cache. The comparison is exact, so only identical inputs hit it."""
-        out = []
-        for image in images:
-            key = (tuple(image.shape), image.dtype, image.device)
-            if key not in self._empty_images:
-                with torch.inference_mode(False):
-                    empty = torch.full(image.shape, -1.0, dtype=image.dtype, device=image.device)
-                self.image_cache.register(empty)
-                self._empty_images[key] = empty
-            empty = self._empty_images[key]
-            out.append(empty if torch.equal(image, empty) else image)
-        return out
+        self._with_cached_constants = EmptyImageSlots(self.image_cache)
 
     @torch.no_grad()
     def __call__(self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs) -> Tensor:
@@ -232,7 +180,8 @@ class GraphedSampler:
             logger.info("Capturing SmolVLA CUDA graphs for prefix shape %s", tuple(prefix_embs.shape))
             # Static buffers must be normal tensors, not inference tensors: they are written in
             # place on every call, whatever grad mode the caller (e.g. RTC guidance) is in.
-            with torch.inference_mode(False):
+            # inference_mode(False) also re-enables autograd, so turn it off again for capture.
+            with torch.inference_mode(False), torch.no_grad():
                 self._graphs[key] = _PrefixGraphs(
                     model, prefix_embs, prefix_pad_masks, prefix_att_masks, self.fill_kv, self.denoise
                 )
