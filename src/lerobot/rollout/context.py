@@ -222,9 +222,15 @@ def build_rollout_context(
             logger.warning("Failed to apply torch.compile: %s", e)
 
     if cfg.tensorrt_engine:
-        from lerobot.policies.act.tensorrt_act import attach_tensorrt_engine
+        # `policy.name`, not `policy.type`: on an nn.Module, `.type` is the dtype-cast method.
+        if policy.name == "diffusion":
+            from lerobot.policies.diffusion.tensorrt_diffusion import attach_tensorrt_engines
 
-        attach_tensorrt_engine(policy, cfg.tensorrt_engine)
+            attach_tensorrt_engines(policy, cfg.tensorrt_engine)
+        else:
+            from lerobot.policies.act.tensorrt_act import attach_tensorrt_engine
+
+            attach_tensorrt_engine(policy, cfg.tensorrt_engine)
 
     # --- 2. Robot-side processors (user-supplied or defaults) --------
     if (

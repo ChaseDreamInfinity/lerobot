@@ -24,12 +24,11 @@ from lerobot.policies.act.tensorrt_act import (
     _ACTChunkModule,
     _example_inputs,
     attach_tensorrt_engine,
-    build_engine,
     engine_input_keys,
     export_onnx,
-    import_tensorrt,
 )
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.tensorrt import build_engine, import_tensorrt
 from tests.utils import require_cuda
 
 WRIST = "observation.images.wrist"

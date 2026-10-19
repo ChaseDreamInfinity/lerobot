@@ -246,6 +246,10 @@ Remaining speed-up lead:
 - **Restrictions:** ACT only, CUDA only, sync inference only. It refuses `--use_torch_compile`.
 - **Input size check:** an engine has fixed input sizes, so a camera resolution that does not
   match the checkpoint gives a clear error.
+- **Shared helpers:** import, ONNX export, engine build and the engine runner are in
+  `src/lerobot/utils/tensorrt.py`, shared with Diffusion Policy (see
+  [DIFFUSION_ORIN_OPTIMIZATION.md](DIFFUSION_ORIN_OPTIMIZATION.md)). The ONNX file is built in a
+  temporary directory and not kept.
 - **No extra installs:** TensorRT 10.3 comes with JetPack, under
   `/usr/lib/python3.10/dist-packages`. The code imports only `tensorrt` from there, so the
   project's own packages are not affected.

@@ -221,8 +221,9 @@ class RolloutConfig:
     torch_compile_mode: str = "default"
     compile_warmup_inferences: int = 2
 
-    # TensorRT (ACT only): serialized engine that replaces the policy's forward pass. Build one
-    # per checkpoint and device with `python -m lerobot.policies.act.tensorrt_act`.
+    # TensorRT: replaces the policy's network with engines built per checkpoint and device.
+    # ACT: an engine file (`python -m lerobot.policies.act.tensorrt_act`). Diffusion: a directory
+    # with the encoder and UNet engines (`python -m lerobot.policies.diffusion.tensorrt_diffusion`).
     tensorrt_engine: str | None = None
 
     # Log per-stage control-loop latency (obs, process, policy, send, loop) every N seconds,
@@ -328,8 +329,10 @@ class RolloutConfig:
 
         # --- TensorRT ---
         if self.tensorrt_engine:
-            if self.policy.type != "act":
-                raise ValueError(f"--tensorrt_engine supports ACT only, got policy type '{self.policy.type}'")
+            if self.policy.type not in ("act", "diffusion"):
+                raise ValueError(
+                    f"--tensorrt_engine supports ACT and Diffusion, got policy type '{self.policy.type}'"
+                )
             if not str(self.device).startswith("cuda"):
                 raise ValueError(f"--tensorrt_engine requires a CUDA device, got '{self.device}'")
             if not isinstance(self.inference, SyncInferenceConfig):
