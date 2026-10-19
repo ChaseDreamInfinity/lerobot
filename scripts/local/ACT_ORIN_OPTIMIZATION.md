@@ -72,6 +72,53 @@ To keep a copy of the log: `bash scripts/local/eval_pick_block_act_orin.sh --trt
 In plain `lerobot-rollout` the flag is `--latency_log_interval_s=5`. It is off by default, and only
 the base strategy, which the eval script uses, reports it.
 
+## The model
+
+One prediction turns two camera images and the arm state into a chunk of 100 future joint
+targets (100×6):
+
+```
+wrist image ─┐                                   1 latent token (zeros)
+             ├─ ResNet-18 ─ 15×20 map ─ 300 tokens ─┐   1 arm-state token
+top image  ──┘   (shared)   per camera   per camera  │        │
+                                                     ▼        ▼
+                         602 tokens ─ transformer encoder (4 layers, width 512)
+                                                     │
+               100 action queries ─ transformer decoder (1 layer) ─ linear head ─ 100×6 actions
+```
+
+- **Image embedding:** one ResNet-18 processes both cameras, one image at a time. Each 480×640
+  image becomes a 15×20 feature map, which is projected to 512 dims: 300 tokens per camera.
+- **Encoder:** 4 layers over 602 tokens: 1 latent + 1 arm state + 2 × 300 image tokens, plus
+  position embeddings.
+- **Decoder:** 1 layer. Its 100 query tokens, one per future action, attend to the encoder output.
+- **Action head:** a linear layer from each decoder output to 6 joint targets.
+- **VAE encoder, training only:** it encodes a demonstrated action sequence into a style latent.
+  At inference there is no demonstration to encode, so it is skipped and the latent is zeros.
+
+**Size**, from the checkpoint:
+
+| Part | Parameters | Used at inference |
+|---|---|---|
+| ResNet-18 backbone | 11.2M | yes |
+| Transformer encoder (4 layers) | 17.3M | yes |
+| Transformer decoder (1 layer) | 5.4M | yes |
+| Projections, embeddings, action head | 0.4M | yes |
+| VAE encoder | 17.4M | no |
+| **Total** | **51.6M** | **~34.2M** |
+
+**On disk:**
+- `model.safetensors` is 207 MB: all 51.6M parameters in fp32.
+- The TensorRT fp16 engine is 70 MB: only the inference parts, mostly in fp16.
+
+That is about 1/100 the size of a VLA such as pi0.5 (around 3B parameters).
+
+**Where the time goes:** in plain PyTorch, about 17 ms of the 36.5 ms forward pass is the two
+ResNet passes and about 20 ms is the transformer. The transformer is small, so most of its time
+on the Orin is the CPU launching many small GPU operations rather than computing. TensorRT fuses
+the whole model, including the ResNet, encoder, decoder and head, into one engine, which brings
+it to 4.8 ms.
+
 ## Progress log
 
 ### 2026-10-18 — baseline measured
