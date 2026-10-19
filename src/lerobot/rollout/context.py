@@ -222,7 +222,8 @@ def build_rollout_context(
         except Exception as e:
             logger.warning("Failed to apply torch.compile: %s", e)
 
-    if cfg.tensorrt_engine:
+    # SmolVLA engines attach further down, once the camera keys the policy will see are known.
+    if cfg.tensorrt_engine and policy.name != "smolvla":
         # `policy.name`, not `policy.type`: on an nn.Module, `.type` is the dtype-cast method.
         if policy.name == "diffusion":
             from lerobot.policies.diffusion.tensorrt_diffusion import attach_tensorrt_engines
@@ -416,17 +417,22 @@ def build_rollout_context(
             "Use --inference.type=rtc or remove relative action processor steps from the policy pipeline."
         )
 
-    if cfg.cuda_graph:
-        from lerobot.policies.smolvla.cuda_graph_smolvla import enable_cuda_graphs
-
-        # Capture now, for the cameras the policy will actually see (after any rename), so the
-        # first real prediction is not slowed down by capture.
+    if cfg.cuda_graph or (cfg.tensorrt_engine and policy.name == "smolvla"):
+        # Capture CUDA graphs now, for the cameras the policy will actually see (after any rename),
+        # so the first real prediction is not slowed down by capture.
         image_keys = [
             cfg.rename_map.get(key, key)
             for key, ft in dataset_features.items()
             if key.startswith(f"{OBS_STR}.images.") and ft["dtype"] in ("image", "video")
         ]
-        enable_cuda_graphs(policy, present_image_keys=image_keys)
+        if cfg.tensorrt_engine:
+            from lerobot.policies.smolvla.tensorrt_smolvla import attach_tensorrt_engines
+
+            attach_tensorrt_engines(policy, cfg.tensorrt_engine, present_image_keys=image_keys)
+        else:
+            from lerobot.policies.smolvla.cuda_graph_smolvla import enable_cuda_graphs
+
+            enable_cuda_graphs(policy, present_image_keys=image_keys)
 
     # --- 7. Inference strategy (needs policy + pre/post + hardware) --
     logger.info(

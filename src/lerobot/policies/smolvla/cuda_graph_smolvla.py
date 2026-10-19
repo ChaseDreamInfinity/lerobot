@@ -72,11 +72,14 @@ class _ConstantImageCache:
     def __init__(self, embed_image: Callable[[Tensor], Tensor]):
         self.embed_image = embed_image
         self.constants: dict[int, tuple[Tensor, Tensor]] = {}
+        # Embeddings computed ahead of ``embed_prefix`` for one prediction (batched encoders).
+        self.precomputed: dict[int, tuple[Tensor, Tensor]] = {}
 
     def __call__(self, image: Tensor) -> Tensor:
-        constant = self.constants.get(id(image))
-        if constant is not None and constant[0] is image:
-            return constant[1]
+        for table in (self.constants, self.precomputed):
+            hit = table.get(id(image))
+            if hit is not None and hit[0] is image:
+                return hit[1]
         return self.embed_image(image)
 
     def register(self, image: Tensor) -> None:
@@ -84,11 +87,47 @@ class _ConstantImageCache:
             self.constants[id(image)] = (image, self.embed_image(image))
 
 
+# Backends for the two graphed stages. ``FillKV(embs, pad_masks, att_masks) -> kv`` builds the
+# prefix KV cache in whatever form ``Denoise(x_t, timestep, pad_masks, kv) -> v_t`` reads.
+FillKV = Callable[[Tensor, Tensor, Tensor], object]
+Denoise = Callable[[Tensor, Tensor, Tensor, object], Tensor]
+
+
+def pytorch_fill_kv(model: VLAFlowMatching) -> FillKV:
+    def fill_kv(embs: Tensor, pad_masks: Tensor, att_masks: Tensor):
+        _, past_key_values = model.vlm_with_expert.forward(
+            attention_mask=make_att_2d_masks(pad_masks, att_masks),
+            position_ids=torch.cumsum(pad_masks, dim=1) - 1,
+            past_key_values=None,
+            inputs_embeds=[embs, None],
+            use_cache=True,
+            fill_kv_cache=True,
+        )
+        return past_key_values
+
+    return fill_kv
+
+
+def pytorch_denoise(model: VLAFlowMatching) -> Denoise:
+    def denoise(x_t: Tensor, timestep: Tensor, pad_masks: Tensor, past_key_values) -> Tensor:
+        return model.denoise_step(
+            x_t=x_t, prefix_pad_masks=pad_masks, past_key_values=past_key_values, timestep=timestep
+        )
+
+    return denoise
+
+
 class _PrefixGraphs:
-    """Static buffers and the two graphs for one prefix shape."""
+    """Static buffers and the two graphs (KV fill, one denoising step) for one prefix shape."""
 
     def __init__(
-        self, model: VLAFlowMatching, prefix_embs: Tensor, prefix_pad_masks: Tensor, prefix_att_masks: Tensor
+        self,
+        model: VLAFlowMatching,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+        fill_kv: FillKV,
+        denoise: Denoise,
     ):
         config = model.config
         device = prefix_embs.device
@@ -98,29 +137,14 @@ class _PrefixGraphs:
         self.x_t = torch.zeros(1, config.chunk_size, config.max_action_dim, device=device)
         self.timestep = torch.ones(1, device=device)
 
-        def fill_kv_cache():
-            _, past_key_values = model.vlm_with_expert.forward(
-                attention_mask=make_att_2d_masks(self.pad_masks, self.att_masks),
-                position_ids=torch.cumsum(self.pad_masks, dim=1) - 1,
-                past_key_values=None,
-                inputs_embeds=[self.embs, None],
-                use_cache=True,
-                fill_kv_cache=True,
-            )
-            return past_key_values
-
-        self.kv_graph, self.past_key_values = _capture(fill_kv_cache)
+        self.kv_graph, self.past_key_values = _capture(
+            lambda: fill_kv(self.embs, self.pad_masks, self.att_masks)
+        )
         self.kv_graph.replay()  # real cache contents for the denoiser warm-up
-
-        def denoise():
-            return model.denoise_step(
-                x_t=self.x_t,
-                prefix_pad_masks=self.pad_masks,
-                past_key_values=self.past_key_values,
-                timestep=self.timestep,
-            )
-
-        self.step_graph, self.v_t = _capture(denoise, pool=self.kv_graph.pool())
+        self.step_graph, self.v_t = _capture(
+            lambda: denoise(self.x_t, self.timestep, self.pad_masks, self.past_key_values),
+            pool=self.kv_graph.pool(),
+        )
 
     def load_prefix(self, prefix_embs: Tensor, prefix_pad_masks: Tensor, prefix_att_masks: Tensor) -> None:
         self.embs.copy_(prefix_embs)
@@ -137,11 +161,25 @@ class _PrefixGraphs:
 
 
 class GraphedSampler:
-    """Drop-in replacement for ``VLAFlowMatching.sample_actions``."""
+    """Drop-in replacement for ``VLAFlowMatching.sample_actions``.
 
-    def __init__(self, model: VLAFlowMatching):
+    The KV fill and denoising step run from CUDA graphs over ``fill_kv`` and ``denoise`` (the
+    PyTorch model by default; TensorRT engines in ``tensorrt_smolvla``). ``encode_images``, if
+    given, encodes all non-constant camera images of a prediction in one batched call.
+    """
+
+    def __init__(
+        self,
+        model: VLAFlowMatching,
+        fill_kv: FillKV | None = None,
+        denoise: Denoise | None = None,
+        encode_images: Callable[[Tensor], Tensor] | None = None,
+    ):
         self.model = model
         self.eager = model.sample_actions
+        self.fill_kv = fill_kv or pytorch_fill_kv(model)
+        self.denoise = denoise or pytorch_denoise(model)
+        self.encode_images = encode_images
         self._graphs: dict[tuple, _PrefixGraphs] = {}
         self._empty_images: dict[tuple, Tensor] = {}
 
@@ -176,16 +214,28 @@ class GraphedSampler:
             noise = model.sample_noise((bsize, config.chunk_size, config.max_action_dim), device)
 
         images = self._with_cached_constants(images)
-        prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
+        if self.encode_images is not None:
+            real = [image for image in images if id(image) not in self.image_cache.constants]
+            if real:
+                embeddings = self.encode_images(torch.cat(real))
+                self.image_cache.precomputed = {
+                    id(image): (image, embeddings[i : i + 1]) for i, image in enumerate(real)
+                }
+        try:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = model.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks, state=state
+            )
+        finally:
+            self.image_cache.precomputed = {}
         key = (tuple(prefix_embs.shape), prefix_embs.dtype)
         if key not in self._graphs:
             logger.info("Capturing SmolVLA CUDA graphs for prefix shape %s", tuple(prefix_embs.shape))
             # Static buffers must be normal tensors, not inference tensors: they are written in
             # place on every call, whatever grad mode the caller (e.g. RTC guidance) is in.
             with torch.inference_mode(False):
-                self._graphs[key] = _PrefixGraphs(model, prefix_embs, prefix_pad_masks, prefix_att_masks)
+                self._graphs[key] = _PrefixGraphs(
+                    model, prefix_embs, prefix_pad_masks, prefix_att_masks, self.fill_kv, self.denoise
+                )
         graphs = self._graphs[key]
         graphs.load_prefix(prefix_embs, prefix_pad_masks, prefix_att_masks)
 

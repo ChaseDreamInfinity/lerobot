@@ -80,18 +80,26 @@ def export_onnx(
     return onnx_path
 
 
-def build_engine(onnx_path: str | Path, engine_path: str | Path, fp16: bool = True) -> Path:
-    """Build a serialized TensorRT engine from an ONNX file."""
+def build_engine(
+    onnx_path: str | Path, engine_path: str | Path, fp16: bool = True, strongly_typed: bool = False
+) -> Path:
+    """Build a serialized TensorRT engine from an ONNX file.
+
+    ``fp16`` lets TensorRT pick fp16 for any layer. ``strongly_typed`` instead makes it keep the
+    ONNX file's own types exactly: export from an fp16 model to get fp16 compute with the model's
+    explicit fp32 upcasts (e.g. in normalization and attention) preserved.
+    """
     trt = import_tensorrt()
     trt_logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(trt_logger)
-    network = builder.create_network(0)
+    flags = 1 << int(trt.NetworkDefinitionCreationFlag.STRONGLY_TYPED) if strongly_typed else 0
+    network = builder.create_network(flags)
     parser = trt.OnnxParser(network, trt_logger)
     if not parser.parse_from_file(str(onnx_path)):
         errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
         raise RuntimeError(f"TensorRT could not parse {onnx_path}:\n{errors}")
     build_config = builder.create_builder_config()
-    if fp16:
+    if fp16 and not strongly_typed:
         build_config.set_flag(trt.BuilderFlag.FP16)
     serialized = builder.build_serialized_network(network, build_config)
     if serialized is None:

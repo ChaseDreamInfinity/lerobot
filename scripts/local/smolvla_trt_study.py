@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 """SmolVLA TensorRT study (Jetson Orin): export, build, and compare against eager and CUDA graphs.
 
-Experimental, not used by rollout. Results are in scripts/local/SMOLVLA_ORIN_OPTIMIZATION.md.
+The first TensorRT study (fp32 KV fill, fp16 step). Superseded by the rollout integration in
+lerobot.policies.smolvla.tensorrt_smolvla (adds a vision engine and a strongly typed fp16 KV fill);
+kept to reproduce the study's numbers. Results are in scripts/local/SMOLVLA_ORIN_OPTIMIZATION.md.
 
 Two engines replace the two parts of sampling that run per prediction after image encoding:
 - KV fill: the 16-layer VLM pass over the 241-token prefix, emitting per-layer K/V (fp32: in fp16
@@ -30,6 +32,7 @@ from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.smolvla import modeling_smolvla
 from lerobot.policies.smolvla.cuda_graph_smolvla import _capture, enable_cuda_graphs
 from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks
+from lerobot.policies.smolvla.tensorrt_smolvla import KVFillExport, StepExport
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.utils.tensorrt import TensorRTEngine, build_engine
 
@@ -70,57 +73,8 @@ def sample_inputs(policy, pre, rng):
     return images, img_masks, *lang, policy.prepare_state(b)
 
 
-class KVFill(torch.nn.Module):
-    """Prefix pass of ``VLAFlowMatching.sample_actions`` with int32 mask arithmetic."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.m = model
-
-    def forward(self, prefix_embs, prefix_pad_masks, prefix_att_masks):
-        pad = prefix_pad_masks.to(torch.int32)
-        cumsum = torch.cumsum(prefix_att_masks.to(torch.int32), dim=1)
-        att_2d = (cumsum[:, None, :] <= cumsum[:, :, None]) & (pad[:, None, :] * pad[:, :, None] > 0)
-        position_ids = (torch.cumsum(pad, dim=1) - 1).to(torch.int64)
-        _, kv = self.m.vlm_with_expert.forward(
-            attention_mask=att_2d,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-            fill_kv_cache=True,
-        )
-        return tuple(t for i in range(len(kv)) for t in (kv[i]["key_states"], kv[i]["value_states"]))
-
-
-class Step(torch.nn.Module):
-    """``VLAFlowMatching.denoise_step`` with int32 mask arithmetic."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.m = model
-
-    def forward(self, x_t, timestep, prefix_pad_masks, *kv):
-        m = self.m
-        past = {i: {"key_states": kv[2 * i], "value_states": kv[2 * i + 1]} for i in range(len(kv) // 2)}
-        suffix_embs, suffix_pad_masks, suffix_att_masks = m.embed_suffix(x_t, timestep)
-        b, suffix_len = suffix_pad_masks.shape
-        prefix_2d = prefix_pad_masks[:, None, :].expand(b, suffix_len, prefix_pad_masks.shape[1])
-        pad = suffix_pad_masks.to(torch.int32)
-        cumsum = torch.cumsum(suffix_att_masks.to(torch.int32), dim=1)
-        suffix_2d = (cumsum[:, None, :] <= cumsum[:, :, None]) & (pad[:, None, :] * pad[:, :, None] > 0)
-        position_ids = (
-            torch.sum(prefix_pad_masks.to(torch.int32), dim=-1)[:, None] + torch.cumsum(pad, dim=1) - 1
-        )
-        out, _ = m.vlm_with_expert.forward(
-            attention_mask=torch.cat([prefix_2d, suffix_2d], dim=2),
-            position_ids=position_ids.to(torch.int64),
-            past_key_values=past,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=True,
-            fill_kv_cache=False,
-        )
-        return m.action_out_proj(out[1][:, -m.config.chunk_size :].to(torch.float32))
+# The export wrappers now live in the policy package (int32 mask arithmetic, flat K/V tuples).
+KVFill, Step = KVFillExport, StepExport
 
 
 KV_NAMES = [f"{k}_{i}" for i in range(16) for k in ("k", "v")]

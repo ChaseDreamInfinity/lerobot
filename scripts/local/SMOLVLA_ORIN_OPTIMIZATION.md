@@ -11,8 +11,9 @@ Checkpoint: `chasedreaminf/smolvla_so101-pick-color-block-in-cup-2cam-run2-v3`.
 ```bash
 bash scripts/local/orin_max_perf.sh                                      # after every reboot
 
-bash scripts/local/eval_pick_block_smolvla_orin.sh --cuda-graph          # recommended
-bash scripts/local/eval_pick_block_smolvla_orin.sh                       # baseline: PyTorch eager
+bash scripts/local/eval_pick_block_smolvla_orin.sh --trt                 # fastest: TensorRT, ~70 ms per chunk
+bash scripts/local/eval_pick_block_smolvla_orin.sh --cuda-graph          # no engines needed: ~127 ms
+bash scripts/local/eval_pick_block_smolvla_orin.sh                       # baseline: PyTorch eager, ~890 ms
 
 TASK="pick up the green block and place it into the cup" \
   bash scripts/local/eval_pick_block_smolvla_orin.sh --cuda-graph        # another block colour
@@ -31,8 +32,13 @@ DURATION=30 bash scripts/local/eval_pick_block_smolvla_orin.sh --cuda-graph --dr
   - **delay:** how many ticks passed while the chunk was computed. Those actions are already in
     the past, so RTC drops them.
   - **queue:** actions waiting after the new chunk is merged in.
-- **Startup:** `--cuda-graph` captures its graphs at startup, which takes about 2 s before the
-  robot starts. There is nothing to build or rebuild.
+- **Startup:** both options capture their CUDA graphs at startup, which takes about 2 s before the
+  robot starts.
+- **Engines for `--trt`:** built automatically on first use (about 3 min), in
+  `outputs/trt_engines/<checkpoint>_orin_fp16/`, or explicitly with
+  `bash scripts/local/build_smolvla_trt_engine_orin.sh`.
+- **When to rebuild:** after a new checkpoint, a JetPack or TensorRT upgrade, or a change in the
+  camera count. Mismatched engines are refused when they load. `--cuda-graph` needs nothing built.
 
 ## The model
 
@@ -291,6 +297,68 @@ stream sync.
   4. Integrating it would mean engines per checkpoint and a rewrite of the RTC loop around a
   graphed TensorRT sampler, which is not justified by one tick. It stays a study.
 
+### 2026-10-19 — full TensorRT path, integrated into rollout
+
+The aim: squeeze out the remaining latency before working on accuracy. Three engines, each
+measured first:
+
+1. **Image encoder, fp16, both cameras in one batch.** 18.0 ms for the two images, against 32 ms
+   for two eager encodes. The SigLIP embeddings' boolean-mask indexing is replaced by an exact
+   `torch.where` equivalent, on an export copy only.
+2. **KV fill, now in fp16.** The overflow was not where assumed. Hooks showed **no layer's
+   output** exceeds fp16's range (largest 2,717), and **plain PyTorch fp16 is accurate**: K/V
+   relative error 0.0067, against 0.058 for bf16. PyTorch avoids the overflow because the model
+   upcasts to fp32 inside RMSNorm and attention, and those casts are no-ops, so they vanish, in an
+   fp32 ONNX export. The fix:
+   - export from an **fp16 copy** of the model (bf16 weights converted to fp16, fp32 modules left
+     as they are), so the upcasts appear as Cast nodes;
+   - build **strongly typed**, so TensorRT keeps them.
+
+   The result is 8.3 ms with relative error 0.024, against 12.7 ms for the fp32 engine.
+3. **Step engine, fp16, with fp16 K/V inputs.** The step is exported from the same fp16 copy, so
+   it reads the KV engine's output directly. Before this, the 32 K/V tensors were converted on
+   every step. A strongly typed step was slower (3.4 ms against 2.9) for no accuracy gain, so the
+   step is built with plain `--fp16`.
+
+**Runtime.** The CUDA-graph sampler (`cuda_graph_smolvla.GraphedSampler`) now takes pluggable
+backends:
+- the KV fill and denoise functions;
+- an optional batched image encoder.
+
+The PyTorch path (`--cuda_graph`) and the TensorRT path share the same graph capture, the
+empty-slot cache and the Python RTC loop. `--tensorrt_engine=<dir>` attaches the engines through
+`lerobot.policies.smolvla.tensorrt_smolvla`, and checks each one against PyTorch when it loads.
+
+**Results**, offline (sampling only, actions vs fp32 eager):
+
+| | No RTC | RTC | Error vs fp32 (max / mean) |
+|---|---|---|---|
+| CUDA graphs | 113.8 ms | 116.3 ms | 0.041 / 0.0024 |
+| **TensorRT** | **58.7 ms** | **61.1 ms** | **0.019 / 0.0012** |
+
+Real `lerobot-rollout` loop at 30 Hz with RTC, the real cameras and a stand-in arm:
+
+| | RTC inference | RTC delay | Queue after merge |
+|---|---|---|---|
+| Eager PyTorch | 890 ms | 27 ticks | 23 |
+| CUDA graphs | 127 ms | 4 ticks | 47 |
+| **TensorRT** | **69–71 ms** (max 81) | **3 ticks** | **48** |
+
+**Where the ~60 ms goes now:**
+
+| Part | Time |
+|---|---|
+| Vision engine (2 images) | 18 ms |
+| Prefix assembly and checks | ~1 ms |
+| KV engine | 8.3 ms |
+| 10 steps | 10 × 2.86 ms |
+
+**Remaining levers:**
+- **INT8 weights for the step engine:** it runs at 2.4× its fp16 memory floor.
+- **INT8 or FP8-style vision:** compute-bound, with accuracy risk.
+- **Fewer flow steps:** this changes the policy, so it is an accuracy decision, not an
+  optimization.
+
 ### Next
 
 **Robot trials** with the fixed camera mapping, at 30 Hz:
@@ -304,6 +372,8 @@ Remaining speed-up lead: see the upper-bound study above.
 
 ## How the speed-up works
 
+- **TensorRT:** `lerobot-rollout --tensorrt_engine=<dir>` uses the three engines, replayed through
+  the same graphed sampler. See the progress log entry above.
 - **Opt-in flag:** `lerobot-rollout --cuda_graph=true` (SmolVLA only) replaces
   `VLAFlowMatching.sample_actions` with a graphed version, and wraps
   `SmolVLMWithExpertModel.embed_image` with the empty-slot cache. The code is in
@@ -318,6 +388,13 @@ Remaining speed-up lead: see the upper-bound study above.
   on every start.
 
 ## Tests
+
+`tests/policies/smolvla/test_smolvla_tensorrt.py` builds engines for a small random SmolVLA, and
+checks two things:
+- TensorRT sampling matches eager, with and without RTC;
+- engines from another checkpoint are refused.
+
+It skips without TensorRT or `onnx`. Run it with `--with onnx`.
 
 `tests/policies/smolvla/test_smolvla_cuda_graph.py` uses a small randomly initialized SmolVLA:
 - graphed sampling matches eager, with and without RTC, across fresh inputs

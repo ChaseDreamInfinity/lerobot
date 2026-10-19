@@ -5,8 +5,9 @@
 # vision-language-action model: it reads the task text, so it can tell the brown block from the
 # blue and green ones in the training data. It runs with Real-Time Chunking (RTC): inference runs
 # in a background thread while the control loop executes the queued actions, so the loop never
-# stalls on inference. --cuda-graph replays sampling from CUDA graphs (~130 ms per chunk instead
-# of ~850 ms); see scripts/local/SMOLVLA_ORIN_OPTIMIZATION.md.
+# stalls on inference. --trt runs it on TensorRT engines (~60 ms per chunk); --cuda-graph replays
+# PyTorch from CUDA graphs (~115 ms), needing no engines; eager PyTorch takes ~855 ms. See
+# scripts/local/SMOLVLA_ORIN_OPTIMIZATION.md.
 #
 # Camera keys: SmolVLA names its cameras camera1/camera2/... The checkpoint was fine-tuned with
 # wrist -> camera1 and top -> camera2 (its train_config.json and saved preprocessor both say so).
@@ -24,11 +25,12 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 
 DRY_RUN=false
 USE_CUDA_GRAPH=false
+USE_TRT=false
 for option in "$@"; do
   case "${option}" in
     --help|-h)
       cat <<'HELP'
-Usage: bash scripts/local/eval_pick_block_smolvla_orin.sh [--cuda-graph] [--dry-run]
+Usage: bash scripts/local/eval_pick_block_smolvla_orin.sh [--trt | --cuda-graph] [--dry-run]
 
 Defaults: SmolVLA pick-color-block policy, CUDA, RTC inference, 120 seconds, no display.
 Control: FPS=30 (the dataset's rate), INTERPOLATION_MULTIPLIER=1.
@@ -36,11 +38,15 @@ Sampling: NUM_STEPS=10 flow-matching steps, NUM_ACTION_STEPS=50 actions per chun
 RTC: RTC_ENABLED=true, RTC_EXECUTION_HORIZON=10, RTC_QUEUE_THRESHOLD=22.
 Cameras: CAMERA_WIDTH=640, CAMERA_HEIGHT=480, CAMERA_FOURCC=MJPG, wrist -> camera1, top -> camera2.
 
---cuda-graph replays the KV-cache fill and each denoising step from CUDA graphs captured at
-startup: ~130 ms per chunk instead of ~850 ms, with identical outputs.
+--trt runs image encoding, KV fill and denoising steps on TensorRT fp16 engines, replayed from
+CUDA graphs: ~60 ms per chunk, actions closer to fp32 than bf16 PyTorch. The engines are built
+automatically on first use (about 3 min), in outputs/trt_engines/<checkpoint name>_orin_fp16/.
+--cuda-graph replays PyTorch from CUDA graphs instead: ~115 ms per chunk, outputs identical to
+eager, no engines to build. Eager PyTorch takes ~855 ms.
 
 Environment overrides:
   POLICY_PATH   Hugging Face repository or local checkpoint directory
+  TRT_ENGINE    Use this TensorRT engine directory instead (implies --trt; must already exist)
   ROBOT_PORT, ROBOT_ID, WRIST_CAMERA, TOP_CAMERA   Hardware configuration
   DEVICE, FPS, DURATION, TASK                       Rollout configuration
   NUM_STEPS, NUM_ACTION_STEPS, INFERENCE_TYPE        Sampling and inference engine
@@ -49,6 +55,7 @@ Environment overrides:
   CAMERA_MAX_FRAME_AGE_MS=2000, CAMERA_RECONNECT_TIMEOUT_S=5.0
 
 Examples:
+  bash scripts/local/eval_pick_block_smolvla_orin.sh --trt
   bash scripts/local/eval_pick_block_smolvla_orin.sh --cuda-graph
   TASK="pick up the green block and place it into the cup" bash scripts/local/eval_pick_block_smolvla_orin.sh --cuda-graph
   DURATION=30 bash scripts/local/eval_pick_block_smolvla_orin.sh --cuda-graph --dry-run
@@ -59,6 +66,7 @@ HELP
       exit 0
       ;;
     --cuda-graph) USE_CUDA_GRAPH=true ;;
+    --trt) USE_TRT=true ;;
     --dry-run) DRY_RUN=true ;;
     *) echo "Unknown option: ${option} (use --help)" >&2; exit 2 ;;
   esac
@@ -67,6 +75,19 @@ done
 export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
 
 POLICY_PATH="${POLICY_PATH:-chasedreaminf/smolvla_so101-pick-color-block-in-cup-2cam-run2-v3}"
+# TensorRT: an explicit TRT_ENGINE must exist; with --trt alone the engine directory follows the
+# checkpoint (same naming as build_smolvla_trt_engine_orin.sh) and is built if missing.
+BUILD_TRT_ENGINE=false
+if [[ -z "${TRT_ENGINE:-}" && "${USE_TRT}" == true ]]; then
+  TRT_ENGINE="outputs/trt_engines/$(basename -- "${POLICY_PATH}")_orin_fp16"
+  for engine in vision kv step; do
+    [[ -f "${TRT_ENGINE}/${engine}.engine" ]] || BUILD_TRT_ENGINE=true
+  done
+fi
+if [[ -n "${TRT_ENGINE:-}" && "${USE_CUDA_GRAPH}" == true ]]; then
+  echo "--trt already uses CUDA graphs; pass only one of --trt and --cuda-graph." >&2
+  exit 2
+fi
 ROBOT_PORT="${ROBOT_PORT:-/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A68008652-if00}"
 ROBOT_ID="${ROBOT_ID:-my_follower}"
 # Cameras default to /dev/v4l/by-path/... rather than /dev/videoN: the numbering
@@ -120,6 +141,12 @@ if [[ "${DRY_RUN}" == false ]]; then
     exit 1
   fi
 
+  if [[ -n "${TRT_ENGINE:-}" && ! -d "${TRT_ENGINE}" && "${BUILD_TRT_ENGINE}" == false ]]; then
+    echo "TensorRT engine directory not found: ${TRT_ENGINE}" >&2
+    echo "Build it with: POLICY_PATH=${POLICY_PATH} bash scripts/local/build_smolvla_trt_engine_orin.sh" >&2
+    exit 1
+  fi
+
   for camera in "${WRIST_CAMERA}" "${TOP_CAMERA}"; do
     if [[ ! -e "${camera}" ]]; then
       echo "Camera not found: ${camera}" >&2
@@ -131,6 +158,12 @@ if [[ "${DRY_RUN}" == false ]]; then
   # shellcheck source=scripts/local/_cuda_guard.sh
   source scripts/local/_cuda_guard.sh
   require_cuda "${DEVICE}"
+
+  if [[ "${BUILD_TRT_ENGINE}" == true ]]; then
+    echo "No TensorRT engines for this checkpoint yet; building ${TRT_ENGINE} (about 3 min)..."
+    POLICY_PATH="${POLICY_PATH}" ENGINE_DIR="${TRT_ENGINE}" NUM_CAMERAS=2 \
+      bash scripts/local/build_smolvla_trt_engine_orin.sh
+  fi
 fi
 
 args=(
@@ -169,10 +202,18 @@ if [[ "${USE_CUDA_GRAPH}" == true ]]; then
   args+=(--cuda_graph=true)
 fi
 
+if [[ -n "${TRT_ENGINE:-}" ]]; then
+  args+=(--tensorrt_engine="${TRT_ENGINE}")
+fi
+
 printf 'Policy: %s\nDevice: %s | Inference: %s | Duration: %s s\n' \
   "${POLICY_PATH}" "${DEVICE}" "${INFERENCE_TYPE}" "${DURATION}"
 printf 'Sampling: %s | Flow steps: %s | Actions per chunk: %s\n' \
-  "$([[ "${USE_CUDA_GRAPH}" == true ]] && echo 'CUDA graphs' || echo 'PyTorch eager')" "${NUM_STEPS}" "${NUM_ACTION_STEPS}"
+  "$(if [[ -n "${TRT_ENGINE:-}" ]]; then echo "TensorRT ${TRT_ENGINE}"; elif [[ "${USE_CUDA_GRAPH}" == true ]]; then echo 'CUDA graphs'; else echo 'PyTorch eager'; fi)" \
+  "${NUM_STEPS}" "${NUM_ACTION_STEPS}"
+if [[ "${DRY_RUN}" == true && "${BUILD_TRT_ENGINE}" == true ]]; then
+  echo "  (engines not built yet: a real run builds them first, about 3 min)"
+fi
 printf 'Control target: %s Hz | Task: %s\n' "${FPS}" "${TASK}"
 printf 'Cameras: %sx%s %s | wrist -> camera1, top -> camera2\n' "${CAMERA_WIDTH}" "${CAMERA_HEIGHT}" "${CAMERA_FOURCC}"
 
