@@ -442,8 +442,29 @@ single block.
 
 | Configuration | Command | Attempts | Successes | Notes |
 |---|---|---|---|---|
-| TensorRT, brown block | `eval_pick_block_smolvla_orin.sh --trt` | | | first run with correct cameras |
-| TensorRT, green block | `TASK="pick up the green block …" … --trt` | | | checks language conditioning |
+| TensorRT, brown block | `eval_pick_block_smolvla_orin.sh --trt` | | 0 | 2026-10-19: 30 Hz, 0 overruns, RTC 70 ms, 3-tick delay. Heads for the brown block but misjudges where it is and doesn't grasp: the same as with CUDA graphs |
+| TensorRT, green block | `TASK="pick up the green block …" … --trt` | | | not run yet; checks language conditioning |
+
+**Accuracy is a training problem, not a runtime one.** Since the runtime went from 890 ms to 70
+ms (RTC delay from 27 to 3 ticks), the arm's behavior hasn't changed: it reaches for the right
+block, misjudges where it is, and fails to grasp. The cameras, rate and runtime are ruled out:
+- the camera mapping is fixed;
+- the loop runs at the dataset's 30 Hz;
+- TensorRT is closer to fp32 than bf16.
+
+Leads for retraining, from the checkpoint's `train_config.json`, not yet tested:
+- **Small budget:** 60k steps at batch 4, about 240k samples. The SmolVLA reference recipe
+  uses batch 64.
+- **Whole model fine-tuned:** `freeze_vision_encoder=false` and `train_expert_only=false`, at
+  lr 5e-5 and batch 4. SmolVLA's defaults freeze the vision encoder and train only the expert
+  (and projections). Fine-tuning the whole 450M model with batches this small may degrade the
+  pretrained vision features that localization relies on.
+- **Mixed tasks:** brown 82 episodes, blue 62, green 62, with 2–3 blocks on the mat in later
+  episodes. The language conditioning has to separate them.
+- A brown-only run, or one with more brown data, would show whether mixing the tasks dilutes
+  aim.
+- **Before retraining:** an offline replay of held-out episodes (predicted vs recorded actions)
+  would separate "can't localize" from "can't grasp".
 
 Remaining speed-up lead: the ~10 ms between offline sampling (~60 ms) and the rollout loop
 (69–71 ms). Getting under 66.7 ms would cut the RTC delay to 2 ticks; see the per-step entry above.
