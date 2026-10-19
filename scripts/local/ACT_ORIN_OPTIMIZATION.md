@@ -229,10 +229,14 @@ supervised runs, resetting the block and cup between attempts:
 | TensorRT, 25-action chunks | `N_ACTION_STEPS=25 … --trt` | | | |
 | TensorRT, temporal ensembling (0.01) | needs a script setting (not added yet) | | | the original ACT recipe |
 
-Remaining speed-up lead:
-- **Image prep:** ~2.5 ms of the ~5 ms `policy` time on ordinary ticks is image preparation that
-  runs even when the result is not used. Running it only on ticks that compute a new chunk would
-  bring ordinary ticks to ~2 ms.
+Image preparation, done:
+- **Before:** about 2.5 ms of the ~5 ms `policy` time on ordinary ticks was converting the camera
+  images on the CPU.
+- **Change:** done during the diffusion work on 2026-10-18: images are now copied to the GPU as
+  8-bit data and converted there (see
+  [DIFFUSION_ORIN_OPTIMIZATION.md](DIFFUSION_ORIN_OPTIMIZATION.md#2026-10-18--prediction-tick-fitted-into-30-hz)).
+- **Result for ACT with TensorRT:** image prep 0.9 ms (was ~2.6). Ordinary ticks 2.4 ms (was
+  4.5). Ticks that compute a new chunk 7.5 ms (was 9.3).
 
 ## How the speed-up works
 

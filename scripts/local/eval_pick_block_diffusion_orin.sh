@@ -8,7 +8,10 @@
 #
 # Defaults to DDIM/5 for faster sampling with the existing checkpoint.
 # Synchronous prediction blocks the control loop at each chunk boundary;
-# FPS=15 is a target, not a guarantee that prediction fits in one tick.
+# FPS defaults to 30, the rate the training data was recorded at: each predicted action is one
+# 1/30 s step, so running slower plays the plan back in slow motion. At 15 Hz the arm hesitated
+# and never went for the block. Only --trt keeps up at 30 Hz (~27 ms per prediction tick);
+# eager PyTorch stalls ~250 ms on every prediction.
 # Use --help for overrides, --trt for TensorRT engines, or --dry-run to inspect the command.
 # Latency log fields and the TensorRT progress log: scripts/local/DIFFUSION_ORIN_OPTIMIZATION.md
 set -euo pipefail
@@ -24,7 +27,7 @@ for option in "$@"; do
 Usage: bash scripts/local/eval_pick_block_diffusion_orin.sh [--trt] [--dry-run]
 
 Defaults: Diffusion pick-block-in-cup policy, CUDA, 120 seconds, no display.
-Control: FPS=15 target, INTERPOLATION_MULTIPLIER=1; synchronous inference.
+Control: FPS=30 (the dataset's rate), INTERPOLATION_MULTIPLIER=1; synchronous inference.
 Sampler: NOISE_SCHEDULER_TYPE=DDIM, NUM_INFERENCE_STEPS=5.
 Cameras: CAMERA_WIDTH=640, CAMERA_HEIGHT=480, CAMERA_FOURCC=MJPG.
 Both cameras use CAMERA_FPS=30; WRIST_CAMERA_FPS and TOP_CAMERA_FPS override it.
@@ -71,7 +74,7 @@ POLICY_PATH="${POLICY_PATH:-chasedreaminf/diffusion_so101-pick-block-in-cup-2cam
 BUILD_TRT_ENGINE=false
 if [[ -z "${TRT_ENGINE:-}" && "${USE_TRT}" == true ]]; then
   TRT_ENGINE="outputs/trt_engines/$(basename -- "${POLICY_PATH}")_orin_fp16"
-  [[ -f "${TRT_ENGINE}/unet.engine" && -f "${TRT_ENGINE}/rgb_encoder.engine" ]] || BUILD_TRT_ENGINE=true
+  [[ -f "${TRT_ENGINE}/unet.engine" && -f "${TRT_ENGINE}/frame_encoder.engine" ]] || BUILD_TRT_ENGINE=true
 fi
 ROBOT_PORT="${ROBOT_PORT:-/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A68008652-if00}"
 ROBOT_ID="${ROBOT_ID:-my_follower}"
@@ -84,7 +87,7 @@ WRIST_CAMERA="${WRIST_CAMERA:-/dev/v4l/by-path/platform-3610000.usb-usb-0:4.4:1.
 TOP_CAMERA="${TOP_CAMERA:-/dev/v4l/by-path/platform-3610000.usb-usb-0:4.1:1.0-video-index0}"
 
 DEVICE="${DEVICE:-cuda}"
-FPS="${FPS:-15}"
+FPS="${FPS:-30}"
 CAMERA_WIDTH="${CAMERA_WIDTH:-640}"
 CAMERA_HEIGHT="${CAMERA_HEIGHT:-480}"
 CAMERA_FPS="${CAMERA_FPS:-30}"

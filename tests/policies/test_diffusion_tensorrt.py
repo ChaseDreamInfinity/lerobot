@@ -23,6 +23,7 @@ from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.policies.diffusion.tensorrt_diffusion import (
     _EncoderModule,
     _example_batch,
+    _GraphedSampler,
     _TensorRTUNet,
     _UNetModule,
     attach_tensorrt_engines,
@@ -84,17 +85,20 @@ def tensorrt():
 @torch.no_grad()
 def test_tensorrt_engines_roundtrip(tensorrt, tmp_path):
     policy = make_policy().to("cuda")
+    reference = make_policy().to("cuda")  # same seed: same weights, stays in PyTorch
     engine_dir = build_engines(policy, tmp_path / "engines", fp16=False)
-    assert sorted(p.name for p in engine_dir.iterdir()) == ["rgb_encoder.engine", "unet.engine"]
+    assert sorted(p.name for p in engine_dir.iterdir()) == ["frame_encoder.engine", "unet.engine"]
 
     batch = _example_batch(policy.config, "cuda")
     noise = torch.randn(1, policy.config.horizon, 6, device="cuda")
     expected = policy.diffusion.generate_actions(batch, noise=noise)  # DDIM: deterministic given noise
 
+    # Tolerances allow for TensorRT using TF32 in "fp32" engines on Ampere and newer GPUs.
     attach_tensorrt_engines(policy, engine_dir)
     assert isinstance(policy.diffusion.unet, _TensorRTUNet)
+    assert isinstance(policy.diffusion.conditional_sample, _GraphedSampler)
     torch.testing.assert_close(
-        policy.diffusion.generate_actions(batch, noise=noise), expected, rtol=0, atol=1e-3
+        policy.diffusion.generate_actions(batch, noise=noise), expected, rtol=0, atol=5e-3
     )
 
     # select_action (observation queues + action queue) goes through the engines.
@@ -105,6 +109,20 @@ def test_tensorrt_engines_roundtrip(tensorrt, tmp_path):
         "observation.images.top": torch.rand(1, 3, 64, 96, device="cuda"),
     }
     assert policy.select_action(obs).shape == (1, 6)
+
+    # The cached per-frame path matches PyTorch on the same observation history, including after
+    # the history has moved on (cached frames are reused, departed ones dropped).
+    for _ in range(3):
+        obs = {k: torch.rand_like(v) for k, v in obs.items()}
+        policy.select_action(obs)
+        reference._queues = policy._queues
+        stacked = {OBS_STATE: obs[OBS_STATE], OBS_IMAGES: obs["observation.images.wrist"]}
+        torch.testing.assert_close(
+            policy.predict_action_chunk(stacked, noise=noise),
+            reference.predict_action_chunk(stacked, noise=noise),
+            rtol=0,
+            atol=5e-3,
+        )
 
 
 @require_cuda

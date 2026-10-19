@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Build TensorRT engines for a Diffusion Policy checkpoint on the Jetson Orin.
 #
-# Two engines, written to one directory: the observation encoder and one UNet denoising step.
-# fp16 on AGX Orin: a DDIM/5 prediction takes ~30 ms instead of ~244 ms eager. The sampler and
-# step count stay adjustable at run time. Engines only load on the GPU model and TensorRT
+# Two engines, written to one directory: the per-frame observation encoder and one UNet
+# denoising step. fp16 on AGX Orin: a DDIM/5 prediction takes ~23 ms instead of ~244 ms eager.
+# The sampler and step count stay adjustable at run time. Engines only load on the GPU model and TensorRT
 # version that built them, so they are tagged "orin" and live under outputs/ (git-ignored).
 # Rebuild after a JetPack upgrade, a new checkpoint, or a camera resolution change.
 #
